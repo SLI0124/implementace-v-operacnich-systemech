@@ -2,14 +2,14 @@
 #include <fstream>
 #include <sstream>
 #include <string>
-#include <map>
 #include <unordered_map>
 #include <filesystem>
 #include <iomanip>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <cstdlib>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #define PORT 8080
 #define INDEX_PATH "www/index.html"
@@ -89,7 +89,7 @@ bool file_exists(const std::string &path) {
     return file.is_open();
 }
 
-std::map<std::string, std::string> mime_types = {
+std::unordered_map<std::string, std::string> mime_types = {
     {".html", "text/html"},
     {".css", "text/css"},
     {".js", "application/javascript"},
@@ -110,9 +110,10 @@ std::string get_mime_type(const std::string &file_path) {
     return "text/html";
 }
 
-void handle_client(const int client_socket) {
+void handle_client(SSL *ssl) {
     char buffer[1024] = {0};
-    read(client_socket, buffer, sizeof(buffer));
+    SSL_read(ssl, buffer, sizeof(buffer));
+
     const HttpRequest http_request = parse_request(buffer);
 
     const std::string file_path = "www" + http_request.path;
@@ -130,12 +131,41 @@ void handle_client(const int client_socket) {
         log("File not found: " + http_request.path);
     }
 
-    dprintf(client_socket, "%s", build_response(200, body, mime_type).c_str());
+    const std::string response = build_response(200, body, mime_type);
+    SSL_write(ssl, response.c_str(), response.length());
     log("Response sent");
-    close(client_socket);
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+}
+
+void load_certificates(SSL_CTX *ctx, const std::string &cert_file, const std::string &key_file) {
+    if (SSL_CTX_use_certificate_file(ctx, cert_file.c_str(), SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+    if (SSL_CTX_use_PrivateKey_file(ctx, key_file.c_str(), SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+    if (!SSL_CTX_check_private_key(ctx)) {
+        std::cerr << "Private key does not match the public certificate." << std::endl;
+        exit(EXIT_FAILURE);
+    }
 }
 
 int main() {
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
+
+    SSL_CTX *ctx = SSL_CTX_new(SSLv23_server_method());
+    if (!ctx) {
+        perror("Unable to create SSL context");
+        exit(EXIT_FAILURE);
+    }
+
+    load_certificates(ctx, "server.crt", "server.key");
+
     int server_fd, new_socket;
     struct sockaddr_in address{};
     const int opt = 1;
@@ -163,9 +193,24 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    while ((new_socket = accept(server_fd, (struct sockaddr *) &address, &addrlen))) {
-        handle_client(new_socket); // Handle one client at a time
+    while (true) {
+        new_socket = accept(server_fd, (struct sockaddr *) &address, &addrlen);
+        if (new_socket < 0) {
+            perror("accept");
+            continue;
+        }
+
+        SSL *ssl = SSL_new(ctx);
+        SSL_set_fd(ssl, new_socket);
+        if (SSL_accept(ssl) <= 0) {
+            ERR_print_errors_fp(stderr);
+        } else {
+            handle_client(ssl);
+        }
+        close(new_socket);
     }
 
+    SSL_CTX_free(ctx);
+    close(server_fd);
     return 0;
 }
