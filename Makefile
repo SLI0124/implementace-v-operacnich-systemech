@@ -1,5 +1,5 @@
 CXX = g++
-CXXFLAGS = -Wall -Wextra -std=c++17 -pthread
+CXXFLAGS = -Wall -Wextra -std=c++17 -pthread -lssl -lcrypto
 
 TARGET = server
 SRC = server.cpp
