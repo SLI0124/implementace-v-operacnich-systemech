@@ -38,8 +38,7 @@ struct HttpRequest {
     std::unordered_map<std::string, std::string> headers;
 };
 
-HttpRequest parse_request(const std::string &request) {
-    std::istringstream stream(request);
+HttpRequest parse_request(std::istringstream &stream) {
     HttpRequest http_request;
     std::string line;
 
@@ -114,7 +113,8 @@ void handle_client(SSL *ssl) {
     char buffer[1024] = {0};
     SSL_read(ssl, buffer, sizeof(buffer));
 
-    const HttpRequest http_request = parse_request(buffer);
+    std::istringstream request_stream(buffer);
+    const HttpRequest http_request = parse_request(request_stream);
 
     const std::string file_path = "www" + http_request.path;
     const std::string mime_type = get_mime_type(file_path);
