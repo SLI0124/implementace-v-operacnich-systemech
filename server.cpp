@@ -10,10 +10,17 @@
 #include <netinet/in.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <semaphore.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
 #define PORT 8080
 #define INDEX_PATH "www/index.html"
 #define FILE_NOT_FOUND_PATH "www/error_404.html"
+#define ERROR_503_PATH "www/error_503.html"
+#define MAX_CONCURRENT_CONNECTIONS 3
+
+sem_t semaphore;
 
 void log(const std::string &message) {
     std::filesystem::create_directories("logs");
@@ -64,6 +71,8 @@ std::string build_response(const int status_code, const std::string &body, const
         case 200: status = "200 OK";
             break;
         case 404: status = "404 Not Found";
+            break;
+        case 503: status = "503 Service Unavailable";
             break;
         case 500: status = "500 Internal Server Error";
             break;
@@ -160,6 +169,7 @@ void load_certificates(SSL_CTX *ctx, const std::string &cert_file, const std::st
 }
 
 int main() {
+    sem_init(&semaphore, 0, MAX_CONCURRENT_CONNECTIONS);
     SSL_library_init();
     SSL_load_error_strings();
     OpenSSL_add_all_algorithms();
@@ -172,7 +182,7 @@ int main() {
 
     load_certificates(ctx, "server.crt", "server.key");
 
-    int server_fd, new_socket;
+    int server_fd;
     struct sockaddr_in address{};
     const int opt = 1;
     socklen_t addrlen = sizeof(address);
@@ -199,24 +209,43 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    while (true) {
-        new_socket = accept(server_fd, (struct sockaddr *) &address, &addrlen);
-        if (new_socket < 0) {
-            perror("accept");
-            continue;
-        }
-
+    while (const int new_socket = accept(server_fd, (struct sockaddr *) &address, &addrlen)) {
         SSL *ssl = SSL_new(ctx);
         SSL_set_fd(ssl, new_socket);
         if (SSL_accept(ssl) <= 0) {
+            fprintf(stderr, "SSL_accept() failed\n");
             ERR_print_errors_fp(stderr);
-        } else {
-            handle_client(ssl);
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+            close(new_socket);
         }
-        close(new_socket);
+
+        if (sem_trywait(&semaphore) == -1) {
+            log("Too many concurrent connections");
+            const std::string body = load_file(ERROR_503_PATH);
+            const std::string response = build_response(503, body, "text/html");
+            SSL_write(ssl, response.c_str(), response.length());
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+            close(new_socket);
+        }
+
+        const pid_t child_pid = fork();
+        if (child_pid == 0) {
+            close(server_fd);
+            handle_client(ssl);
+            sem_post(&semaphore);
+            close(new_socket);
+            exit(EXIT_SUCCESS);
+        } else if (child_pid > 0) {
+            close(new_socket);
+        } else {
+            perror("fork");
+        }
     }
 
     SSL_CTX_free(ctx);
+    sem_destroy(&semaphore);
     close(server_fd);
     return 0;
 }
