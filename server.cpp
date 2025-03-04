@@ -76,11 +76,17 @@ std::string build_response(const int status_code, const std::string &body, const
 }
 
 std::string load_file(const std::string &path) {
-    std::ifstream file(path);
+    std::ifstream file(path, std::ios::binary);
     if (!file) throw std::runtime_error("Could not open file: " + path);
-    std::ostringstream content;
-    content << file.rdbuf();
-    return content.str();
+
+    std::string content;
+    char buffer[4096];
+
+    while (file.read(buffer, sizeof(buffer)) || file.gcount() > 0) {
+        content.append(buffer, file.gcount());
+    }
+
+    return content;
 }
 
 bool file_exists(const std::string &path) {
