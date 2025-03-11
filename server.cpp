@@ -68,7 +68,23 @@ std::string read_file(const std::string &file_path) {
 
 void handle_client(SSL *ssl, int msg_queue_id) {
     char buffer[1024] = {0};
-    SSL_read(ssl, buffer, sizeof(buffer));
+    const int bytes = SSL_read(ssl, buffer, sizeof(buffer));
+
+    if (bytes <= 0) {
+        const int err = SSL_get_error(ssl, bytes);
+        if (err == SSL_ERROR_ZERO_RETURN) {
+            log_event("Client closed the connection gracefully", msg_queue_id);
+        } else if (err == SSL_ERROR_SYSCALL || err == SSL_ERROR_SSL) {
+            log_event("Client disconnected abruptly or SSL error", msg_queue_id);
+            ERR_print_errors_fp(stderr);
+        } else {
+            log_event("SSL read error", msg_queue_id);
+            ERR_print_errors_fp(stderr);
+        }
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+        return;
+    }
 
     std::string response;
     std::string content = read_file(INDEX_PATH);
@@ -78,9 +94,17 @@ void handle_client(SSL *ssl, int msg_queue_id) {
     } else {
         response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n" + content;
     }
-    SSL_write(ssl, response.c_str(), response.length());
+
+
+    if (SSL_write(ssl, response.c_str(), response.length()) <= 0) {
+        log_event("SSL write error", msg_queue_id);
+        ERR_print_errors_fp(stderr);
+    }
 
     log_event("Worker handled SSL client", msg_queue_id);
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
 }
 
 void load_certificates(SSL_CTX *ctx, const std::string &cert_file, const std::string &key_file) {
@@ -120,9 +144,8 @@ void worker_process(const int sock_fd, const int msg_queue_id, SSL_CTX *ctx) {
 
             struct sockaddr_in client_addr{};
             socklen_t addrlen = sizeof(client_addr);
-            getpeername(client_fd, (struct sockaddr *) &client_addr, &addrlen);
+            getpeername(client_fd, (sockaddr *) &client_addr, &addrlen);
 
-            // Print worker info
             char client_ip[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
             const int client_port = ntohs(client_addr.sin_port);
@@ -131,13 +154,16 @@ void worker_process(const int sock_fd, const int msg_queue_id, SSL_CTX *ctx) {
 
             SSL *ssl = SSL_new(ctx);
             SSL_set_fd(ssl, client_fd);
+
             if (SSL_accept(ssl) <= 0) {
                 ERR_print_errors_fp(stderr);
-            } else {
-                handle_client(ssl, msg_queue_id);
+                SSL_shutdown(ssl);
+                SSL_free(ssl);
+                close(client_fd);
+                continue;
             }
-            SSL_shutdown(ssl);
-            SSL_free(ssl);
+
+            handle_client(ssl, msg_queue_id);
             close(client_fd);
         }
     }
@@ -164,17 +190,17 @@ int main() {
 
     // Create worker processes
     int worker_sockets[MAX_WORKERS][2];
-    for (int i = 0; i < MAX_WORKERS; ++i) {
-        if (socketpair(AF_UNIX, SOCK_STREAM, 0, worker_sockets[i]) == -1) {
+    for (auto &worker_socket: worker_sockets) {
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, worker_socket) == -1) {
             perror("socketpair");
             exit(EXIT_FAILURE);
         }
         if (fork() == 0) {
-            close(worker_sockets[i][1]); // Close the parent's end
-            worker_process(worker_sockets[i][0], msg_queue_id, ctx);
+            close(worker_socket[1]); // Close the parent's end
+            worker_process(worker_socket[0], msg_queue_id, ctx);
             exit(0);
         }
-        close(worker_sockets[i][0]); // Close the child's end
+        close(worker_socket[0]); // Close the child's end
     }
 
     struct sockaddr_in address{};
@@ -187,7 +213,7 @@ int main() {
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(PORT);
-    if (bind(server_fd, (struct sockaddr *) &address, sizeof(address)) == -1) {
+    if (bind(server_fd, (sockaddr *) &address, sizeof(address)) == -1) {
         perror("bind");
         exit(EXIT_FAILURE);
     }
@@ -198,8 +224,7 @@ int main() {
 
     // main loop to accept incoming connections
     int round_robin = 0;
-    while (true) {
-        int client_socket = accept(server_fd, (struct sockaddr *) &address, &addrlen);
+    while (int client_socket = accept(server_fd, (struct sockaddr *) &address, &addrlen)) {
         if (client_socket == -1) {
             perror("accept");
             continue;
