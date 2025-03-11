@@ -30,7 +30,6 @@ struct LogMessage {
     char message[512];
 };
 
-
 std::string get_timestamp() {
     std::time_t now = std::time(nullptr);
     char buf[100];
@@ -83,7 +82,14 @@ std::string read_file(const std::string &file_path) {
     return buffer.str();
 }
 
-void handle_client(SSL *ssl, const int msg_queue_id, const std::string &client_ip, int client_port) {
+std::string parse_http_request(const std::string &request) {
+    std::istringstream request_stream(request);
+    std::string method, path, protocol;
+    request_stream >> method >> path >> protocol;
+    return path;
+}
+
+void handle_client(SSL *ssl, int msg_queue_id, const std::string &client_ip, int client_port) {
     char buffer[1024] = {0};
     const int bytes = SSL_read(ssl, buffer, sizeof(buffer));
 
@@ -103,13 +109,23 @@ void handle_client(SSL *ssl, const int msg_queue_id, const std::string &client_i
         return;
     }
 
+    const std::string request(buffer, bytes);
+    const std::string path = parse_http_request(request);
+
     std::string response;
-    std::string content = read_file(INDEX_PATH);
-    if (content.empty()) {
+    std::string content;
+
+    if (path == "/" || path == "/index.html") {
+        content = read_file(INDEX_PATH);
+        if (content.empty()) {
+            content = read_file(FILE_NOT_FOUND_PATH);
+            response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n" + content;
+        } else {
+            response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n" + content;
+        }
+    } else {
         content = read_file(FILE_NOT_FOUND_PATH);
         response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n" + content;
-    } else {
-        response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n" + content;
     }
 
     if (SSL_write(ssl, response.c_str(), response.length()) <= 0) {
