@@ -16,6 +16,7 @@
 #include <sys/msg.h>
 #include <sys/un.h>
 #include <arpa/inet.h>
+#include <ctime>
 
 #define PORT 8080
 #define INDEX_PATH "www/index.html"
@@ -26,13 +27,29 @@
 
 struct LogMessage {
     long mtype;
-    char message[256];
+    char message[512];
 };
 
-void log_event(const std::string &message, int msg_queue_id) {
+
+std::string get_timestamp() {
+    std::time_t now = std::time(nullptr);
+    char buf[100];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+    return std::string(buf);
+}
+
+void log_event(const std::string &message, int msg_queue_id, const std::string &client_ip = "", int client_port = 0) {
     LogMessage log_msg{};
     log_msg.mtype = 1;
-    strncpy(log_msg.message, message.c_str(), sizeof(log_msg.message) - 1);
+
+    std::ostringstream log_stream;
+    log_stream << "[" << get_timestamp() << "] [PID: " << getpid() << "]";
+    if (!client_ip.empty()) {
+        log_stream << " [Client: " << client_ip << ":" << client_port << "]";
+    }
+    log_stream << " " << message;
+
+    strncpy(log_msg.message, log_stream.str().c_str(), sizeof(log_msg.message) - 1);
     log_msg.message[sizeof(log_msg.message) - 1] = '\0';
     msgsnd(msg_queue_id, &log_msg, sizeof(log_msg.message), 0);
 }
@@ -66,19 +83,19 @@ std::string read_file(const std::string &file_path) {
     return buffer.str();
 }
 
-void handle_client(SSL *ssl, int msg_queue_id) {
+void handle_client(SSL *ssl, const int msg_queue_id, const std::string &client_ip, int client_port) {
     char buffer[1024] = {0};
     const int bytes = SSL_read(ssl, buffer, sizeof(buffer));
 
     if (bytes <= 0) {
         const int err = SSL_get_error(ssl, bytes);
         if (err == SSL_ERROR_ZERO_RETURN) {
-            log_event("Client closed the connection gracefully", msg_queue_id);
+            log_event("Client closed the connection gracefully", msg_queue_id, client_ip, client_port);
         } else if (err == SSL_ERROR_SYSCALL || err == SSL_ERROR_SSL) {
-            log_event("Client disconnected abruptly or SSL error", msg_queue_id);
+            log_event("Client disconnected abruptly or SSL error", msg_queue_id, client_ip, client_port);
             ERR_print_errors_fp(stderr);
         } else {
-            log_event("SSL read error", msg_queue_id);
+            log_event("SSL read error", msg_queue_id, client_ip, client_port);
             ERR_print_errors_fp(stderr);
         }
         SSL_shutdown(ssl);
@@ -95,13 +112,12 @@ void handle_client(SSL *ssl, int msg_queue_id) {
         response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n" + content;
     }
 
-
     if (SSL_write(ssl, response.c_str(), response.length()) <= 0) {
-        log_event("SSL write error", msg_queue_id);
+        log_event("SSL write error", msg_queue_id, client_ip, client_port);
         ERR_print_errors_fp(stderr);
     }
 
-    log_event("Worker handled SSL client", msg_queue_id);
+    log_event("Worker handled SSL client", msg_queue_id, client_ip, client_port);
 
     SSL_shutdown(ssl);
     SSL_free(ssl);
@@ -149,13 +165,14 @@ void worker_process(const int sock_fd, const int msg_queue_id, SSL_CTX *ctx) {
             char client_ip[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
             const int client_port = ntohs(client_addr.sin_port);
-            std::cout << "Worker " << getpid() << " handling connection from " << client_ip << ":" << client_port <<
-                    std::endl;
+
+            log_event("Worker handling connection", msg_queue_id, client_ip, client_port);
 
             SSL *ssl = SSL_new(ctx);
             SSL_set_fd(ssl, client_fd);
 
             if (SSL_accept(ssl) <= 0) {
+                log_event("SSL handshake failed", msg_queue_id, client_ip, client_port);
                 ERR_print_errors_fp(stderr);
                 SSL_shutdown(ssl);
                 SSL_free(ssl);
@@ -163,7 +180,7 @@ void worker_process(const int sock_fd, const int msg_queue_id, SSL_CTX *ctx) {
                 continue;
             }
 
-            handle_client(ssl, msg_queue_id);
+            handle_client(ssl, msg_queue_id, client_ip, client_port);
             close(client_fd);
         }
     }
@@ -230,7 +247,7 @@ int main() {
             continue;
         }
 
-        std::cout << "Parent handing off connection to worker " << round_robin << std::endl;
+        log_event("Parent handing off connection to worker " + std::to_string(round_robin), msg_queue_id);
 
         struct msghdr msg = {};
         char buf[CMSG_SPACE(sizeof(int))];
