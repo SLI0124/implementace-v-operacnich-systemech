@@ -13,144 +13,65 @@
 #include <semaphore.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/msg.h>
+#include <sys/un.h>
+#include <arpa/inet.h>
 
 #define PORT 8080
 #define INDEX_PATH "www/index.html"
 #define FILE_NOT_FOUND_PATH "www/error_404.html"
 #define ERROR_503_PATH "www/error_503.html"
-#define MAX_CONCURRENT_CONNECTIONS 3
+#define MAX_WORKERS 3
+#define LOG_MSG_QUEUE_KEY 1234
 
-sem_t semaphore;
+struct LogMessage {
+    long mtype;
+    char message[256];
+};
 
-void log(const std::string &message) {
-    std::filesystem::create_directories("logs");
+void log_event(const std::string &message, int msg_queue_id) {
+    LogMessage log_msg{};
+    log_msg.mtype = 1;
+    strncpy(log_msg.message, message.c_str(), sizeof(log_msg.message) - 1);
+    log_msg.message[sizeof(log_msg.message) - 1] = '\0';
+    msgsnd(msg_queue_id, &log_msg, sizeof(log_msg.message), 0);
+}
+
+void logger_process() {
+    const int msg_queue_id = msgget(LOG_MSG_QUEUE_KEY, IPC_CREAT | 0666);
+    if (msg_queue_id == -1) {
+        perror("msgget");
+        exit(EXIT_FAILURE);
+    }
     std::ofstream log_file("logs/log.txt", std::ios::app);
-    const time_t now = time(nullptr);
-    const struct tm *localTime = localtime(&now);
-
-    if (!log_file) {
-        std::cerr << "Error creating log file!" << std::endl;
-    } else {
-        log_file << "[" << std::setw(2) << std::setfill('0') << localTime->tm_hour << ":"
-                << std::setw(2) << std::setfill('0') << localTime->tm_min << ":"
-                << std::setw(2) << std::setfill('0') << localTime->tm_sec << "] "
-                << message << std::endl;
+    LogMessage log_msg{};
+    while (true) {
+        msgrcv(msg_queue_id, &log_msg, sizeof(log_msg.message), 0, 0);
+        log_file << log_msg.message << std::endl;
     }
 }
 
-struct HttpRequest {
-    std::string method;
-    std::string path;
-    std::string version;
-    std::unordered_map<std::string, std::string> headers;
-};
-
-HttpRequest parse_request(std::istringstream &stream) {
-    HttpRequest http_request;
-    std::string line;
-
-    std::getline(stream, line);
-    std::istringstream line_stream(line);
-    line_stream >> http_request.method >> http_request.path >> http_request.version;
-
-    while (std::getline(stream, line) && !line.empty()) {
-        size_t colon_pos = line.find(':');
-        if (colon_pos != std::string::npos) {
-            std::string key = line.substr(0, colon_pos);
-            std::string value = line.substr(colon_pos + 1);
-            value.erase(0, value.find_first_not_of(" \t")); // Trim leading whitespace
-            http_request.headers[key] = value;
-        }
-    }
-    return http_request;
-}
-
-std::string build_response(const int status_code, const std::string &body, const std::string &mime_type) {
-    std::string status;
-    switch (status_code) {
-        case 200: status = "200 OK";
-            break;
-        case 404: status = "404 Not Found";
-            break;
-        case 503: status = "503 Service Unavailable";
-            break;
-        case 500: status = "500 Internal Server Error";
-            break;
-        default: status = "200 OK";
-            break;
-    }
-    return "HTTP/1.1 " + status + "\r\n" +
-           "Content-Type: " + mime_type + "\r\n" +
-           "Connection: close\r\n\r\n" + body;
-}
-
-std::string load_file(const std::string &path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) throw std::runtime_error("Could not open file: " + path);
-
-    std::string content;
-    char buffer[4096];
-
-    while (file.read(buffer, sizeof(buffer)) || file.gcount() > 0) {
-        content.append(buffer, file.gcount());
-    }
-
-    return content;
-}
-
-bool file_exists(const std::string &path) {
-    std::ifstream file(path);
-    return file.is_open();
-}
-
-std::unordered_map<std::string, std::string> mime_types = {
-    {".html", "text/html"},
-    {".css", "text/css"},
-    {".js", "application/javascript"},
-    {".png", "image/png"},
-    {".jpg", "image/jpeg"},
-    {".gif", "image/gif"},
-    {".svg", "image/svg+xml"}
-};
-
-std::string get_mime_type(const std::string &file_path) {
-    const size_t pos = file_path.find_last_of('.');
-    if (pos != std::string::npos) {
-        const std::string ext = file_path.substr(pos);
-        if (mime_types.count(ext)) {
-            return mime_types[ext];
-        }
-    }
-    return "text/html";
+std::string read_file(const std::string &file_path) {
+    std::ifstream file(file_path);
+    if (!file) return "";
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    return buffer.str();
 }
 
 void handle_client(SSL *ssl) {
     char buffer[1024] = {0};
     SSL_read(ssl, buffer, sizeof(buffer));
 
-    std::istringstream request_stream(buffer);
-    const HttpRequest http_request = parse_request(request_stream);
-
-    const std::string file_path = "www" + http_request.path;
-    const std::string mime_type = get_mime_type(file_path);
-    std::string body;
-
-    if (http_request.path == "/") {
-        body = load_file(INDEX_PATH);
-        log("Index file requested");
-    } else if (file_exists(file_path)) {
-        body = load_file(file_path);
-        log("File found: " + file_path);
+    std::string response;
+    std::string content = read_file(INDEX_PATH);
+    if (content.empty()) {
+        content = read_file(FILE_NOT_FOUND_PATH);
+        response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n" + content;
     } else {
-        body = load_file(FILE_NOT_FOUND_PATH);
-        log("File not found: " + http_request.path);
+        response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n" + content;
     }
-
-    const std::string response = build_response(200, body, mime_type);
     SSL_write(ssl, response.c_str(), response.length());
-    log("Response sent");
-    SSL_shutdown(ssl);
-    SSL_free(ssl);
 }
 
 void load_certificates(SSL_CTX *ctx, const std::string &cert_file, const std::string &key_file) {
@@ -168,84 +89,104 @@ void load_certificates(SSL_CTX *ctx, const std::string &cert_file, const std::st
     }
 }
 
+void worker_process(const int sock_fd, const int msg_queue_id, SSL_CTX *ctx) {
+    while (true) {
+        int client_fd;
+        struct msghdr msg = {};
+        char buf[CMSG_SPACE(sizeof(int))];
+        struct iovec io = {.iov_base = &client_fd, .iov_len = sizeof(client_fd)};
+        msg.msg_iov = &io;
+        msg.msg_iovlen = 1;
+        msg.msg_control = buf;
+        msg.msg_controllen = sizeof(buf);
+        recvmsg(sock_fd, &msg, 0);
+        const struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+
+        if (cmsg && cmsg->cmsg_len == CMSG_LEN(sizeof(int)) && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type ==
+            SCM_RIGHTS) {
+            memcpy(&client_fd, CMSG_DATA(cmsg), sizeof(client_fd));
+
+            struct sockaddr_in client_addr{};
+            socklen_t addrlen = sizeof(client_addr);
+            getpeername(client_fd, (struct sockaddr *) &client_addr, &addrlen);
+
+            // Print worker info
+            char client_ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
+            int client_port = ntohs(client_addr.sin_port);
+            std::cout << "Worker " << getpid() << " handling connection from " << client_ip << ":" << client_port <<
+                    std::endl;
+
+            SSL *ssl = SSL_new(ctx);
+            SSL_set_fd(ssl, client_fd);
+            if (SSL_accept(ssl) <= 0) {
+                ERR_print_errors_fp(stderr);
+            } else {
+                log_event("Worker handling SSL client", msg_queue_id);
+                handle_client(ssl);
+            }
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+            close(client_fd);
+        }
+    }
+}
+
 int main() {
-    sem_init(&semaphore, 0, MAX_CONCURRENT_CONNECTIONS);
     SSL_library_init();
     SSL_load_error_strings();
     OpenSSL_add_all_algorithms();
-
     SSL_CTX *ctx = SSL_CTX_new(SSLv23_server_method());
-    if (!ctx) {
-        perror("Unable to create SSL context");
-        exit(EXIT_FAILURE);
-    }
-
     load_certificates(ctx, "server.crt", "server.key");
 
-    int server_fd;
+    const int msg_queue_id = msgget(LOG_MSG_QUEUE_KEY, IPC_CREAT | 0666);
+    if (msg_queue_id == -1) {
+        perror("msgget");
+        exit(EXIT_FAILURE);
+    }
+    if (fork() == 0) {
+        logger_process();
+    }
+    int worker_sockets[MAX_WORKERS][2];
+    for (auto &worker_socket: worker_sockets) {
+        socketpair(AF_UNIX, SOCK_STREAM, 0, worker_socket);
+        if (fork() == 0) {
+            close(worker_socket[1]);
+            worker_process(worker_socket[0], msg_queue_id, ctx);
+            exit(0);
+        }
+        close(worker_socket[0]);
+    }
     struct sockaddr_in address{};
-    const int opt = 1;
     socklen_t addrlen = sizeof(address);
-
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("socket failed");
-        exit(EXIT_FAILURE);
-    }
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
-        perror("setsockopt");
-        exit(EXIT_FAILURE);
-    }
-
+    const int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(PORT);
+    bind(server_fd, (struct sockaddr *) &address, sizeof(address));
+    listen(server_fd, 10);
+    int round_robin = 0;
+    while (true) {
+        int client_socket = accept(server_fd, (struct sockaddr *) &address, &addrlen);
 
-    if (bind(server_fd, (struct sockaddr *) &address, sizeof(address)) < 0) {
-        perror("bind failed");
-        exit(EXIT_FAILURE);
+        std::cout << "Parent handing off connection to worker " << round_robin << std::endl;
+
+        struct msghdr msg = {};
+        char buf[CMSG_SPACE(sizeof(int))];
+        struct iovec io = {.iov_base = &client_socket, .iov_len = sizeof(client_socket)};
+        msg.msg_iov = &io;
+        msg.msg_iovlen = 1;
+        msg.msg_control = buf;
+        msg.msg_controllen = sizeof(buf);
+        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+        memcpy(CMSG_DATA(cmsg), &client_socket, sizeof(client_socket));
+        sendmsg(worker_sockets[round_robin][1], &msg, 0);
+        round_robin = (round_robin + 1) % MAX_WORKERS;
+        close(client_socket);
     }
-    if (listen(server_fd, 3) < 0) {
-        perror("listen");
-        exit(EXIT_FAILURE);
-    }
-
-    while (const int new_socket = accept(server_fd, (struct sockaddr *) &address, &addrlen)) {
-        SSL *ssl = SSL_new(ctx);
-        SSL_set_fd(ssl, new_socket);
-        if (SSL_accept(ssl) <= 0) {
-            fprintf(stderr, "SSL_accept() failed\n");
-            ERR_print_errors_fp(stderr);
-            SSL_shutdown(ssl);
-            SSL_free(ssl);
-            close(new_socket);
-        }
-
-        if (sem_trywait(&semaphore) == -1) {
-            log("Too many concurrent connections");
-            const std::string body = load_file(ERROR_503_PATH);
-            const std::string response = build_response(503, body, "text/html");
-            SSL_write(ssl, response.c_str(), response.length());
-            SSL_shutdown(ssl);
-            SSL_free(ssl);
-            close(new_socket);
-        }
-
-        const pid_t child_pid = fork();
-        if (child_pid == 0) {
-            close(server_fd);
-            handle_client(ssl);
-            sem_post(&semaphore);
-            close(new_socket);
-            exit(EXIT_SUCCESS);
-        } else if (child_pid > 0) {
-            close(new_socket);
-        } else {
-            perror("fork");
-        }
-    }
-
     SSL_CTX_free(ctx);
-    sem_destroy(&semaphore);
-    close(server_fd);
     return 0;
 }
