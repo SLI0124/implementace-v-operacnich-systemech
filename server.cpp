@@ -14,6 +14,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/msg.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <arpa/inet.h>
 #include <ctime>
@@ -122,6 +123,53 @@ void handle_client(SSL *ssl, int msg_queue_id, const std::string &client_ip, int
             response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n" + content;
         } else {
             response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n" + content;
+        }
+    } else if (path.substr(path.find_last_of(".") + 1) == "php") {
+        const std::string php_path = "www" + path;
+        // Check if the PHP file exists
+        struct stat php_buffer{};
+        if (stat(php_path.c_str(), &php_buffer) != 0) {
+            content = read_file(FILE_NOT_FOUND_PATH);
+            response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n" + content;
+        } else {
+            int pipefd[2];
+            if (pipe(pipefd) == -1) {
+                perror("pipe");
+                return;
+            }
+
+            const pid_t pid = fork();
+            if (pid == -1) {
+                perror("fork");
+                return;
+            }
+
+            if (pid == 0) {
+                // Child process
+                close(pipefd[0]); // Close unused read end
+                dup2(pipefd[1], STDOUT_FILENO); // Redirect stdout to pipe
+                close(pipefd[1]);
+
+                char *args[] = {(char *) "/usr/bin/php", (char *) php_path.c_str(), nullptr}; // Use full path to php
+                execvp("/usr/bin/php", args);
+                perror("execvp");
+                exit(EXIT_FAILURE);
+            } else {
+                // Parent process
+                close(pipefd[1]); // Close unused write end
+                char php_output[4096];
+                const ssize_t n = read(pipefd[0], php_output, sizeof(php_output));
+                close(pipefd[0]);
+                waitpid(pid, nullptr, 0);
+
+                if (n > 0) {
+                    response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
+                    response.append(php_output, n);
+                } else {
+                    response = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html\r\n"
+                            "Connection: close\r\n\r\n";
+                }
+            }
         }
     } else {
         content = read_file(FILE_NOT_FOUND_PATH);
