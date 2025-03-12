@@ -206,7 +206,9 @@ int main() {
     SSL_library_init();
     SSL_load_error_strings();
     OpenSSL_add_all_algorithms();
-    SSL_CTX *ctx = SSL_CTX_new(SSLv23_server_method());
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    SSL_CTX_set_options(ctx, SSL_OP_NO_TICKET);
+    SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_SERVER);
     load_certificates(ctx, "server.crt", "server.key");
 
     const int msg_queue_id = msgget(LOG_MSG_QUEUE_KEY, IPC_CREAT | 0666);
