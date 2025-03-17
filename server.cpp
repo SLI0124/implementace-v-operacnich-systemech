@@ -32,7 +32,7 @@ struct LogMessage {
 };
 
 std::string get_timestamp() {
-    std::time_t now = std::time(nullptr);
+    const std::time_t now = std::time(nullptr);
     char buf[100];
     std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
     return std::string(buf);
@@ -118,7 +118,7 @@ void handle_php_request(const std::string &php_path, std::string &response) {
         return;
     }
 
-    pid_t pid = fork();
+    const pid_t pid = fork();
     if (pid == -1) {
         perror("fork");
         response = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
@@ -137,7 +137,7 @@ void handle_php_request(const std::string &php_path, std::string &response) {
     } else {
         close(pipefd[1]);
         char php_output[4096];
-        ssize_t n = read(pipefd[0], php_output, sizeof(php_output));
+        const ssize_t n = read(pipefd[0], php_output, sizeof(php_output));
         close(pipefd[0]);
         waitpid(pid, nullptr, 0);
 
@@ -197,7 +197,6 @@ void handle_post_request(const std::string &body, const std::string &client_ip, 
     size_t file_content_end = body.find("--" + boundary, file_content_start);
     std::string file_content = body.substr(file_content_start, file_content_end - file_content_start);
 
-    // Debug: Print the file path
     std::string file_path = std::string(UPLOAD_DIR) + "/" + filename;
     std::cout << "Saving file to: " << file_path << std::endl;
 
@@ -214,7 +213,7 @@ void handle_post_request(const std::string &body, const std::string &client_ip, 
     log_event("File uploaded: " + filename, msg_queue_id, client_ip, client_port);
 }
 
-void handle_client(SSL *ssl, int msg_queue_id, const std::string &client_ip, int client_port) {
+void handle_client(SSL *ssl, const int msg_queue_id, const std::string &client_ip, const int client_port) {
     char buffer[1024] = {0};
     const int bytes = SSL_read(ssl, buffer, sizeof(buffer));
 
@@ -238,11 +237,11 @@ void handle_client(SSL *ssl, int msg_queue_id, const std::string &client_ip, int
 
     // Extract Content-Length from the request headers
     size_t content_length = 0;
-    size_t content_length_pos = request.find("Content-Length: ");
+    const size_t content_length_pos = request.find("Content-Length: ");
     if (content_length_pos != std::string::npos) {
-        size_t content_length_end = request.find("\r\n", content_length_pos);
-        std::string content_length_str = request.substr(content_length_pos + 16,
-                                                        content_length_end - (content_length_pos + 16));
+        const size_t content_length_end = request.find("\r\n", content_length_pos);
+        const std::string content_length_str = request.substr(content_length_pos + 16,
+                                                              content_length_end - (content_length_pos + 16));
         content_length = std::stoul(content_length_str);
     }
 
@@ -252,7 +251,7 @@ void handle_client(SSL *ssl, int msg_queue_id, const std::string &client_ip, int
         body = request;
         while (body.size() < content_length) {
             char additional_buffer[1024] = {0};
-            int additional_bytes = SSL_read(ssl, additional_buffer, sizeof(additional_buffer));
+            const int additional_bytes = SSL_read(ssl, additional_buffer, sizeof(additional_buffer));
             if (additional_bytes <= 0) {
                 log_event("Failed to read request body", msg_queue_id, client_ip, client_port);
                 SSL_shutdown(ssl);
@@ -279,7 +278,7 @@ void handle_client(SSL *ssl, int msg_queue_id, const std::string &client_ip, int
 
         // Check if the file exists
         if (!std::filesystem::exists(file_path)) {
-            std::string content = read_file(FILE_NOT_FOUND_PATH);
+            const std::string content = read_file(FILE_NOT_FOUND_PATH);
             response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n" + content;
         }
         // Handle PHP files
@@ -288,9 +287,9 @@ void handle_client(SSL *ssl, int msg_queue_id, const std::string &client_ip, int
         }
         // Serve static files
         else {
-            std::string content = read_file(file_path);
+            const std::string content = read_file(file_path);
             if (!content.empty()) {
-                std::string content_type = get_content_type(file_path);
+                const std::string content_type = get_content_type(file_path);
                 response = "HTTP/1.1 200 OK\r\nContent-Type: " + content_type +
                            "\r\nConnection: close\r\n\r\n" + content;
             } else {
@@ -381,7 +380,7 @@ int main() {
     SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
     SSL_CTX_set_options(ctx, SSL_OP_NO_TICKET);
     SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_SERVER);
-    load_certificates(ctx, "server.crt", "server.key");
+    load_certificates(ctx, "certificates/server.crt", "certificates/server.key");
 
     const int msg_queue_id = msgget(LOG_MSG_QUEUE_KEY, IPC_CREAT | 0666);
     if (msg_queue_id == -1) {
@@ -395,7 +394,7 @@ int main() {
     }
 
     // Start logger process
-    pid_t logger_pid = fork();
+    const pid_t logger_pid = fork();
     if (logger_pid == 0) {
         logger_process();
         exit(0);
