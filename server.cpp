@@ -268,8 +268,27 @@ void handle_client(SSL *ssl, int msg_queue_id, const std::string &client_ip, int
         handle_post_request(body, client_ip, client_port, msg_queue_id);
         response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\nFile uploaded successfully.";
     } else {
-        // Handle other requests (GET, etc.)
-        response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
+        std::string file_path = "www" + path;
+        if (file_path == "www/") {
+            file_path = INDEX_PATH;
+        }
+
+        // Handle PHP files
+        if (file_path.find(".php") != std::string::npos) {
+            handle_php_request(file_path, response);
+        }
+        // Serve static files
+        else {
+            std::string content = read_file(file_path);
+            if (!content.empty()) {
+                std::string content_type = get_content_type(file_path);
+                response = "HTTP/1.1 200 OK\r\nContent-Type: " + content_type +
+                           "\r\nConnection: close\r\n\r\n" + content;
+            } else {
+                std::string content = read_file(FILE_NOT_FOUND_PATH);
+                response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n" + content;
+            }
+        }
     }
 
     if (SSL_write(ssl, response.c_str(), response.length()) <= 0) {
