@@ -18,6 +18,7 @@
 #include <sys/un.h>
 #include <arpa/inet.h>
 #include <ctime>
+#include <csignal>
 
 #define PORT 8080
 #define INDEX_PATH "www/index.html"
@@ -25,6 +26,7 @@
 #define ERROR_503_PATH "www/error_503.html"
 #define MAX_WORKERS 3
 #define LOG_MSG_QUEUE_KEY 1234
+#define UPLOAD_DIR "www/uploads"
 
 struct LogMessage {
     long mtype;
@@ -51,6 +53,7 @@ void log_event(const std::string &message, int msg_queue_id, const std::string &
 
     strncpy(log_msg.message, log_stream.str().c_str(), sizeof(log_msg.message) - 1);
     log_msg.message[sizeof(log_msg.message) - 1] = '\0';
+    printf("%s\n", log_msg.message);
     msgsnd(msg_queue_id, &log_msg, sizeof(log_msg.message), 0);
 }
 
@@ -90,6 +93,123 @@ std::string parse_http_request(const std::string &request) {
     return path;
 }
 
+std::string get_content_type(const std::string &path) {
+    const std::string extension = path.substr(path.find_last_of('.') + 1);
+    if (extension == "html" || extension == "htm") return "text/html";
+    if (extension == "css") return "text/css";
+    if (extension == "js") return "application/javascript";
+    if (extension == "json") return "application/json";
+    if (extension == "jpg" || extension == "jpeg") return "image/jpeg";
+    if (extension == "png") return "image/png";
+    if (extension == "gif") return "image/gif";
+    if (extension == "pdf") return "application/pdf";
+    return "text/plain";
+}
+
+void handle_php_request(const std::string &php_path, std::string &response) {
+    int pipefd[2];
+    if (pipe(pipefd) == -1) {
+        perror("pipe");
+        response = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        perror("fork");
+        response = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
+        return;
+    }
+
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+
+        char *args[] = {(char *) "/usr/bin/php", (char *) php_path.c_str(), nullptr};
+        execvp("/usr/bin/php", args);
+        perror("execvp");
+        exit(EXIT_FAILURE);
+    } else {
+        close(pipefd[1]);
+        char php_output[4096];
+        ssize_t n = read(pipefd[0], php_output, sizeof(php_output));
+        close(pipefd[0]);
+        waitpid(pid, nullptr, 0);
+
+        if (n > 0) {
+            response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
+            response.append(php_output, n);
+        } else {
+            response = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
+        }
+    }
+}
+
+void handle_post_request(const std::string &body, const std::string &client_ip, int client_port, int msg_queue_id) {
+    std::istringstream body_stream(body);
+    std::string line;
+    std::string boundary;
+
+    // Extract boundary from Content-Type header
+    while (std::getline(body_stream, line) && line != "\r") {
+        if (line.find("Content-Type: multipart/form-data; boundary=") != std::string::npos) {
+            boundary = line.substr(line.find("boundary=") + 9);
+            boundary.pop_back(); // Remove trailing \r
+        }
+    }
+
+    if (boundary.empty()) {
+        log_event("Invalid POST request: Missing boundary", msg_queue_id, client_ip, client_port);
+        return;
+    }
+
+    // Find the boundary in the body
+    size_t pos = body.find("--" + boundary);
+    if (pos == std::string::npos) {
+        log_event("Boundary not found in POST request", msg_queue_id, client_ip, client_port);
+        return;
+    }
+
+    // Find the filename in the Content-Disposition header
+    pos = body.find("filename=\"", pos);
+    if (pos == std::string::npos) {
+        log_event("Filename not found in POST request", msg_queue_id, client_ip, client_port);
+        return;
+    }
+
+    size_t filename_start = pos + 10; // "filename=\"" is 10 characters
+    size_t filename_end = body.find('\"', filename_start);
+    std::string filename = body.substr(filename_start, filename_end - filename_start);
+
+    // Find the start of the file content
+    pos = body.find("\r\n\r\n", filename_end);
+    if (pos == std::string::npos) {
+        log_event("File content not found in POST request", msg_queue_id, client_ip, client_port);
+        return;
+    }
+
+    size_t file_content_start = pos + 4; // Skip "\r\n\r\n"
+    size_t file_content_end = body.find("--" + boundary, file_content_start);
+    std::string file_content = body.substr(file_content_start, file_content_end - file_content_start);
+
+    // Debug: Print the file path
+    std::string file_path = std::string(UPLOAD_DIR) + "/" + filename;
+    std::cout << "Saving file to: " << file_path << std::endl;
+
+    // Save the file
+    std::ofstream out_file(file_path, std::ios::binary);
+    if (!out_file) {
+        log_event("Failed to create file on server: " + file_path, msg_queue_id, client_ip, client_port);
+        return;
+    }
+
+    out_file.write(file_content.c_str(), file_content.size());
+    out_file.close();
+
+    log_event("File uploaded: " + filename, msg_queue_id, client_ip, client_port);
+}
+
 void handle_client(SSL *ssl, int msg_queue_id, const std::string &client_ip, int client_port) {
     char buffer[1024] = {0};
     const int bytes = SSL_read(ssl, buffer, sizeof(buffer));
@@ -111,69 +231,45 @@ void handle_client(SSL *ssl, int msg_queue_id, const std::string &client_ip, int
     }
 
     const std::string request(buffer, bytes);
+
+    // Extract Content-Length from the request headers
+    size_t content_length = 0;
+    size_t content_length_pos = request.find("Content-Length: ");
+    if (content_length_pos != std::string::npos) {
+        size_t content_length_end = request.find("\r\n", content_length_pos);
+        std::string content_length_str = request.substr(content_length_pos + 16,
+                                                        content_length_end - (content_length_pos + 16));
+        content_length = std::stoul(content_length_str);
+    }
+
+    // Read the remaining request body if Content-Length is larger than the initial buffer
+    std::string body;
+    if (content_length > 0) {
+        body = request;
+        while (body.size() < content_length) {
+            char additional_buffer[1024] = {0};
+            int additional_bytes = SSL_read(ssl, additional_buffer, sizeof(additional_buffer));
+            if (additional_bytes <= 0) {
+                log_event("Failed to read request body", msg_queue_id, client_ip, client_port);
+                SSL_shutdown(ssl);
+                SSL_free(ssl);
+                return;
+            }
+            body.append(additional_buffer, additional_bytes);
+        }
+    }
+
+    // Handle the request
+    const std::string method = request.substr(0, request.find(' '));
     const std::string path = parse_http_request(request);
 
     std::string response;
-    std::string content;
-
-    if (path == "/" || path == "/index.html") {
-        content = read_file(INDEX_PATH);
-        if (content.empty()) {
-            content = read_file(FILE_NOT_FOUND_PATH);
-            response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n" + content;
-        } else {
-            response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n" + content;
-        }
-    } else if (path.substr(path.find_last_of(".") + 1) == "php") {
-        const std::string php_path = "www" + path;
-        // Check if the PHP file exists
-        struct stat php_buffer{};
-        if (stat(php_path.c_str(), &php_buffer) != 0) {
-            content = read_file(FILE_NOT_FOUND_PATH);
-            response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n" + content;
-        } else {
-            int pipefd[2];
-            if (pipe(pipefd) == -1) {
-                perror("pipe");
-                return;
-            }
-
-            const pid_t pid = fork();
-            if (pid == -1) {
-                perror("fork");
-                return;
-            }
-
-            if (pid == 0) {
-                // Child process
-                close(pipefd[0]); // Close unused read end
-                dup2(pipefd[1], STDOUT_FILENO); // Redirect stdout to pipe
-                close(pipefd[1]);
-
-                char *args[] = {(char *) "/usr/bin/php", (char *) php_path.c_str(), nullptr}; // Use full path to php
-                execvp("/usr/bin/php", args);
-                perror("execvp");
-                exit(EXIT_FAILURE);
-            } else {
-                // Parent process
-                close(pipefd[1]); // Close unused write end
-                char php_output[4096];
-                const ssize_t n = read(pipefd[0], php_output, sizeof(php_output));
-                close(pipefd[0]);
-                waitpid(pid, nullptr, 0);
-
-                if (n > 0) {
-                    response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
-                    response.append(php_output, n);
-                } else {
-                    response = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html\r\n"
-                            "Connection: close\r\n\r\n";
-                }
-            }
-        }
+    if (method == "POST" && path == "/upload") {
+        handle_post_request(body, client_ip, client_port, msg_queue_id);
+        response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\nFile uploaded successfully.";
     } else {
-        content = read_file(FILE_NOT_FOUND_PATH);
-        response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n" + content;
+        // Handle other requests (GET, etc.)
+        response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
     }
 
     if (SSL_write(ssl, response.c_str(), response.length()) <= 0) {
@@ -265,25 +361,32 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
+    // Create upload directory if it doesn't exist
+    if (!std::filesystem::exists(UPLOAD_DIR)) {
+        std::filesystem::create_directory(UPLOAD_DIR);
+    }
+
     // Start logger process
-    if (fork() == 0) {
+    pid_t logger_pid = fork();
+    if (logger_pid == 0) {
         logger_process();
         exit(0);
     }
 
     // Create worker processes
     int worker_sockets[MAX_WORKERS][2];
-    for (auto &worker_socket: worker_sockets) {
-        if (socketpair(AF_UNIX, SOCK_STREAM, 0, worker_socket) == -1) {
+    pid_t worker_pids[MAX_WORKERS];
+    for (int i = 0; i < MAX_WORKERS; i++) {
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, worker_sockets[i]) == -1) {
             perror("socketpair");
             exit(EXIT_FAILURE);
         }
-        if (fork() == 0) {
-            close(worker_socket[1]); // Close the parent's end
-            worker_process(worker_socket[0], msg_queue_id, ctx);
+        if ((worker_pids[i] = fork()) == 0) {
+            close(worker_sockets[i][1]); // Close the parent's end
+            worker_process(worker_sockets[i][0], msg_queue_id, ctx);
             exit(0);
         }
-        close(worker_socket[0]); // Close the child's end
+        close(worker_sockets[i][0]); // Close the child's end
     }
 
     struct sockaddr_in address{};
@@ -307,7 +410,8 @@ int main() {
 
     // main loop to accept incoming connections
     int round_robin = 0;
-    while (int client_socket = accept(server_fd, (struct sockaddr *) &address, &addrlen)) {
+    while (true) {
+        int client_socket = accept(server_fd, (struct sockaddr *) &address, &addrlen);
         if (client_socket == -1) {
             perror("accept");
             continue;
@@ -315,25 +419,58 @@ int main() {
 
         log_event("Parent handing off connection to worker " + std::to_string(round_robin), msg_queue_id);
 
-        struct msghdr msg = {};
-        char buf[CMSG_SPACE(sizeof(int))];
-        struct iovec io = {.iov_base = &client_socket, .iov_len = sizeof(client_socket)};
-        msg.msg_iov = &io;
-        msg.msg_iovlen = 1;
-        msg.msg_control = buf;
-        msg.msg_controllen = sizeof(buf);
-        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-        cmsg->cmsg_level = SOL_SOCKET;
-        cmsg->cmsg_type = SCM_RIGHTS;
-        memcpy(CMSG_DATA(cmsg), &client_socket, sizeof(client_socket));
-        if (sendmsg(worker_sockets[round_robin][1], &msg, 0) == -1) {
-            perror("sendmsg");
+        // Check if the worker process is still alive before sending the socket
+        if (waitpid(worker_pids[round_robin], nullptr, WNOHANG) == 0) {
+            // Worker is still alive, send the socket
+            struct msghdr msg = {};
+            char buf[CMSG_SPACE(sizeof(int))];
+            struct iovec io = {.iov_base = &client_socket, .iov_len = sizeof(client_socket)};
+            msg.msg_iov = &io;
+            msg.msg_iovlen = 1;
+            msg.msg_control = buf;
+            msg.msg_controllen = sizeof(buf);
+            struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+            cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+            cmsg->cmsg_level = SOL_SOCKET;
+            cmsg->cmsg_type = SCM_RIGHTS;
+            memcpy(CMSG_DATA(cmsg), &client_socket, sizeof(client_socket));
+
+            if (sendmsg(worker_sockets[round_robin][1], &msg, 0) == -1) {
+                perror("sendmsg");
+                close(client_socket);
+            }
+            round_robin = (round_robin + 1) % MAX_WORKERS;
+        } else {
+            log_event("Worker " + std::to_string(round_robin) + " is no longer alive, restarting.", msg_queue_id);
+            close(worker_sockets[round_robin][1]);
+            if (socketpair(AF_UNIX, SOCK_STREAM, 0, worker_sockets[round_robin]) == -1) {
+                perror("socketpair");
+                close(client_socket);
+                continue;
+            }
+            if ((worker_pids[round_robin] = fork()) == 0) {
+                close(worker_sockets[round_robin][1]); // Close the parent's end
+                worker_process(worker_sockets[round_robin][0], msg_queue_id, ctx);
+                exit(0);
+            }
+            close(worker_sockets[round_robin][0]); // Close the child's end
+            close(client_socket);
         }
-        round_robin = (round_robin + 1) % MAX_WORKERS;
-        close(client_socket);
     }
 
+    // Clean up
+    close(server_fd);
     SSL_CTX_free(ctx);
+
+    // Terminate worker processes
+    for (int i = 0; i < MAX_WORKERS; i++) {
+        close(worker_sockets[i][1]);
+        waitpid(worker_pids[i], nullptr, 0);
+    }
+
+    // Terminate logger process
+    kill(logger_pid, SIGTERM);
+    waitpid(logger_pid, nullptr, 0);
+
     return 0;
 }
