@@ -5,3 +5,4 @@ logs/
 server
 server.crt
 server.key
+www/uploads
