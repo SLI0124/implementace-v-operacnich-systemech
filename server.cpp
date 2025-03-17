@@ -359,7 +359,8 @@ void worker_process(const int sock_fd, const int msg_queue_id, SSL_CTX *ctx) {
             SSL_set_fd(ssl, client_fd);
 
             if (SSL_accept(ssl) <= 0) {
-                log_event("SSL handshake failed", msg_queue_id, client_ip, client_port);
+                log_event("SSL handshake failed: " + std::string(ERR_error_string(ERR_get_error(), nullptr)),
+                          msg_queue_id, client_ip, client_port);
                 ERR_print_errors_fp(stderr);
                 SSL_shutdown(ssl);
                 SSL_free(ssl);
@@ -374,6 +375,10 @@ void worker_process(const int sock_fd, const int msg_queue_id, SSL_CTX *ctx) {
 }
 
 int main() {
+    // Ignore SIGPIPE to prevent crashes on writes to closed sockets
+    signal(SIGPIPE, SIG_IGN);
+
+    // Initialize OpenSSL
     SSL_library_init();
     SSL_load_error_strings();
     OpenSSL_add_all_algorithms();
@@ -382,6 +387,7 @@ int main() {
     SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_SERVER);
     load_certificates(ctx, "certificates/server.crt", "certificates/server.key");
 
+    // Create message queue for logging
     const int msg_queue_id = msgget(LOG_MSG_QUEUE_KEY, IPC_CREAT | 0666);
     if (msg_queue_id == -1) {
         perror("msgget");
@@ -416,6 +422,7 @@ int main() {
         close(worker_sockets[i][0]); // Close the child's end
     }
 
+    // Set up server socket
     struct sockaddr_in address{};
     socklen_t addrlen = sizeof(address);
     const int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -435,7 +442,7 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    // main loop to accept incoming connections
+    // Main loop to accept incoming connections
     int round_robin = 0;
     while (true) {
         int client_socket = accept(server_fd, (struct sockaddr *) &address, &addrlen);
@@ -446,7 +453,7 @@ int main() {
 
         log_event("Parent handing off connection to worker " + std::to_string(round_robin), msg_queue_id);
 
-        // Check if the worker process is still alive before sending the socket
+        // Check if the worker process is still alive
         if (waitpid(worker_pids[round_robin], nullptr, WNOHANG) == 0) {
             // Worker is still alive, send the socket
             struct msghdr msg = {};
@@ -464,10 +471,11 @@ int main() {
 
             if (sendmsg(worker_sockets[round_robin][1], &msg, 0) == -1) {
                 perror("sendmsg");
-                close(client_socket);
             }
+            close(client_socket); // Close the client socket in the main process
             round_robin = (round_robin + 1) % MAX_WORKERS;
         } else {
+            // Worker is dead, restart it
             log_event("Worker " + std::to_string(round_robin) + " is no longer alive, restarting.", msg_queue_id);
             close(worker_sockets[round_robin][1]);
             if (socketpair(AF_UNIX, SOCK_STREAM, 0, worker_sockets[round_robin]) == -1) {
@@ -476,11 +484,11 @@ int main() {
                 continue;
             }
             if ((worker_pids[round_robin] = fork()) == 0) {
-                close(worker_sockets[round_robin][1]); // Close the parent's end
+                close(worker_sockets[round_robin][1]);
                 worker_process(worker_sockets[round_robin][0], msg_queue_id, ctx);
                 exit(0);
             }
-            close(worker_sockets[round_robin][0]); // Close the child's end
+            close(worker_sockets[round_robin][0]);
             close(client_socket);
         }
     }
