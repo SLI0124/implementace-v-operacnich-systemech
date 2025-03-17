@@ -61,11 +61,17 @@ void logger_process() {
         perror("msgget");
         exit(EXIT_FAILURE);
     }
+
+    if (!std::filesystem::exists("logs")) {
+        std::filesystem::create_directory("logs");
+    }
+
     std::ofstream log_file("logs/log.txt", std::ios::app);
     if (!log_file) {
         std::cerr << "Failed to open log file." << std::endl;
         exit(EXIT_FAILURE);
     }
+
     LogMessage log_msg{};
     while (true) {
         if (msgrcv(msg_queue_id, &log_msg, sizeof(log_msg.message), 0, 0) == -1) {
