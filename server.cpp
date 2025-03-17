@@ -2,7 +2,6 @@
 #include <fstream>
 #include <sstream>
 #include <string>
-#include <unordered_map>
 #include <filesystem>
 #include <iomanip>
 #include <unistd.h>
@@ -10,7 +9,6 @@
 #include <netinet/in.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-#include <semaphore.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/msg.h>
@@ -273,8 +271,13 @@ void handle_client(SSL *ssl, int msg_queue_id, const std::string &client_ip, int
             file_path = INDEX_PATH;
         }
 
+        // Check if the file exists
+        if (!std::filesystem::exists(file_path)) {
+            std::string content = read_file(FILE_NOT_FOUND_PATH);
+            response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n" + content;
+        }
         // Handle PHP files
-        if (file_path.find(".php") != std::string::npos) {
+        else if (file_path.find(".php") != std::string::npos) {
             handle_php_request(file_path, response);
         }
         // Serve static files
