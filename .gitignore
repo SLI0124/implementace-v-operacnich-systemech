@@ -1,8 +1,8 @@
 .idea/
 cmake-build-debug/
 .vscode/
-logs/
+http_server/logs/
 server
-certificates/server.crt
-certificates/server.key
-www/uploads
+http_server/certificates/server.crt
+http_server/certificates/server.key
+http_server/www/uploads

@@ -130,20 +130,25 @@ void handle_php_request(const std::string &php_path, std::string &response) {
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
 
-        char *args[] = {(char *) "/usr/bin/php", (char *) php_path.c_str(), nullptr};
-        execvp("/usr/bin/php", args);
+        char *args[] = {(char *) "/usr/bin/php-cgi", (char *) php_path.c_str(), nullptr};
+        execvp("/usr/bin/php-cgi", args);
         perror("execvp");
         exit(EXIT_FAILURE);
     } else {
         close(pipefd[1]);
-        char php_output[4096];
-        const ssize_t n = read(pipefd[0], php_output, sizeof(php_output));
+        std::string php_output;
+        const size_t buffer_size = 16384; // Increased buffer size
+        char buffer[buffer_size];
+        ssize_t n;
+        while ((n = read(pipefd[0], buffer, sizeof(buffer))) > 0) {
+            php_output.append(buffer, n);
+        }
         close(pipefd[0]);
         waitpid(pid, nullptr, 0);
 
-        if (n > 0) {
+        if (!php_output.empty()) {
             response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
-            response.append(php_output, n);
+            response.append(php_output);
         } else {
             response = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
         }
@@ -451,8 +456,6 @@ int main() {
             continue;
         }
 
-        log_event("Parent handing off connection to worker " + std::to_string(round_robin), msg_queue_id);
-
         // Check if the worker process is still alive
         if (waitpid(worker_pids[round_robin], nullptr, WNOHANG) == 0) {
             // Worker is still alive, send the socket
@@ -489,6 +492,25 @@ int main() {
                 exit(0);
             }
             close(worker_sockets[round_robin][0]);
+            close(client_socket);
+        }
+
+        // Check if all workers are busy
+        bool all_workers_busy = true;
+        for (int i = 0; i < MAX_WORKERS; i++) {
+            if (waitpid(worker_pids[i], nullptr, WNOHANG) == 0) {
+                all_workers_busy = false;
+                break;
+            }
+        }
+
+        if (all_workers_busy) {
+            // Send 503 Service Unavailable response
+            const std::string content = read_file(ERROR_503_PATH);
+            const std::string response =
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n" +
+                    content;
+            send(client_socket, response.c_str(), response.length(), 0);
             close(client_socket);
         }
     }
