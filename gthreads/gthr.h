@@ -3,6 +3,28 @@ enum {
 	StackSize = 0x400000, // Size of stack of each thread
 };
 
+// Thread performance tracking structure
+struct gt_metrics {
+    struct timeval creation_time;       // Thread creation timestamp
+    struct timeval exec_start_time;     // Last execution start time
+    struct timeval ready_start_time;    // Last time thread became ready
+    
+    unsigned long exec_total_time;      // Total execution time (microseconds)
+    unsigned long wait_total_time;      // Total wait time (microseconds)
+    
+    unsigned long exec_shortest;        // Shortest execution period
+    unsigned long exec_longest;         // Longest execution period
+    unsigned long exec_time_sum;        // Sum for average calculation
+    unsigned long exec_time_sq_sum;     // Sum of squares for variance
+    unsigned int exec_periods;          // Number of execution periods
+    
+    unsigned long wait_shortest;        // Shortest wait period
+    unsigned long wait_longest;         // Longest wait period
+    unsigned long wait_time_sum;        // Sum for average calculation
+    unsigned long wait_time_sq_sum;     // Sum of squares for variance
+    unsigned int wait_periods;          // Number of wait periods
+};
+
 struct gt {
 	// Saved context, switched by gtswtch.S (see for detail)
 	struct gt_context {
@@ -21,6 +43,9 @@ struct gt {
 		Running,
 		Ready,
 	} state;
+	
+	// Performance tracking data
+	struct gt_metrics metrics;
 };
 
 
