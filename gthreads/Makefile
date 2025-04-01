@@ -1,7 +1,8 @@
 CFLAGS = -g -Wall
+LDLIBS = -lm
 
 gthr_demo: gthr.o gthr_switch.o main.o
-	$(CC) -o $@ $^
+	$(CC) -o $@ $^ $(LDLIBS)
 
 .S.o:
 	as -o $@ $^
