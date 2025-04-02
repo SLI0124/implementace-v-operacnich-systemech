@@ -1,10 +1,7 @@
 .idea/
-cmake-build-debug/
 .vscode/
 http_server/logs/
 http_server/server
-http_server/certificates/server.crt
-http_server/certificates/server.key
 http_server/www/uploads
 gthreads/*.o
 gthreads/gthr_demo
