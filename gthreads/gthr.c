@@ -54,9 +54,9 @@ void gt_print_stats() {
     gettimeofday(&current_time, NULL);
     
     printf("\n================ Thread Performance Report ================\n");
-    printf("%-4s | %-8s | %-12s | %-12s | %-10s | %-10s\n", 
-           "ID", "Status", "Exec Time(μs)", "Wait Time(μs)", "Avg Exec", "Avg Wait");
-    printf("---------------------------------------------------------\n");
+    printf("%-4s | %-8s | %-8s | %-8s | %-12s | %-12s | %-10s | %-10s\n", 
+           "ID", "Status", "Priority", "Original", "Exec Time(μs)", "Wait Time(μs)", "Avg Exec", "Avg Wait");
+    printf("---------------------------------------------------------------------\n");
     
     for (int i = 0; i < MaxGThreads; i++) {
         struct gt *thread = &gt_table[i];
@@ -93,8 +93,10 @@ void gt_print_stats() {
             thread->state == Running ? "Running" : 
             thread->state == Ready ? "Ready" : "Unused";
         
-        printf("%-4d | %-8s | %-12lu | %-12lu | %-10.2f | %-10.2f\n", 
-               i, state_str, total_exec, total_wait, avg_exec, avg_wait);
+        printf("%-4d | %-8s | %-8d | %-8d | %-12lu | %-12lu | %-10.2f | %-10.2f\n", 
+               i, state_str, 
+               thread->priority, thread->original_priority,
+               total_exec, total_wait, avg_exec, avg_wait);
     }
     
     printf("\n--- Detailed Statistics ---\n");
@@ -115,6 +117,8 @@ void gt_print_stats() {
             }
             
             printf("Thread %d:\n", i);
+            printf("  Priority: %d (Original: %d), Starvation count: %d\n", 
+                   thread->priority, thread->original_priority, thread->starvation_count);
             printf("  RSP: 0x%lx\n", thread->ctx.rsp);
             printf("  Execution: min=%lu μs, max=%lu μs, periods=%u, variance=%.2f\n",
                    thread->metrics.exec_shortest == ULONG_MAX ? 0 : thread->metrics.exec_shortest,
@@ -170,6 +174,8 @@ bool gt_schedule(void) {
 	struct gt_context *old, *new;
 	struct timeval switch_time;
 	gettimeofday(&switch_time, NULL);
+	bool thread_found = false;
+	static int round_robin_index = 0;  // Index to start our search from (for round-robin fairness)
 
 	gt_reset_sig(SIGALRM); // reset signal
 
@@ -190,15 +196,70 @@ bool gt_schedule(void) {
 		gt_current->metrics.exec_time_sq_sum += (exec_time * exec_time);
 	}
 
-	// Find next thread to run
-	p = gt_current;
-	while (p->state != Ready) {
-		// iterate through gt_table[] until we find new thread in state Ready
-		if (++p == &gt_table[MaxGThreads]) // at the end rotate to the beginning
-			p = &gt_table[0];
-		if (p == gt_current) // did not find any other Ready threads
-			return false;
+	// First reset starvation counter for current thread if it was running
+	if (gt_current->state == Running) {
+		gt_current->starvation_count = 0;
+		// Reset the thread's priority to its original value
+		gt_current->priority = gt_current->original_priority;
 	}
+	
+	// Increment starvation counter for all Ready threads
+	for (p = &gt_table[0]; p < &gt_table[MaxGThreads]; p++) {
+		if (p->state == Ready) {
+			p->starvation_count++;
+			// The more it starves, the higher its priority becomes
+			// Starving threads now get priority boost much faster
+			int new_priority = p->original_priority - p->starvation_count;
+			if (new_priority < MinPriority) new_priority = MinPriority;
+			p->priority = new_priority;
+			
+			// If a thread has been starving for too long, force it to run next
+			if (p->starvation_count > 10) {
+				// Super boost - give it highest priority plus a bonus
+				p->priority = MinPriority - 1;  // Even higher than normal highest priority
+			}
+		}
+	}
+	
+	// Find next thread to run based on priority
+	struct gt *selected_thread = NULL;
+	int max_starvation = -1;  // Track the thread with the most starvation
+	
+	// First, check if any thread has critical starvation (force it to run)
+	for (p = &gt_table[0]; p < &gt_table[MaxGThreads]; p++) {
+		if (p->state == Ready && p->starvation_count > 10 && p->starvation_count > max_starvation) {
+			selected_thread = p;
+			max_starvation = p->starvation_count;
+			thread_found = true;
+		}
+	}
+	
+	// If no critically starving thread, use priority-based scheduling
+	if (!thread_found) {
+		// Use round-robin within each priority level for fairness
+		// Start searching from the thread after the last scheduled one
+		int start_idx = (round_robin_index + 1) % MaxGThreads;
+		
+		// First search loop - look for highest priority thread starting from round_robin_index
+		for (int current_priority = MinPriority; current_priority <= MaxPriority && !thread_found; current_priority++) {
+			for (int i = 0; i < MaxGThreads && !thread_found; i++) {
+				int idx = (start_idx + i) % MaxGThreads;
+				p = &gt_table[idx];
+				if (p->state == Ready && p->priority == current_priority) {
+					selected_thread = p;
+					round_robin_index = idx;  // Update for next scheduling decision
+					thread_found = true;
+				}
+			}
+		}
+	}
+	
+	// If no Ready thread was found, return false
+	if (!selected_thread) {
+		return false;
+	}
+	
+	p = selected_thread;
 
 	// Update wait time for the thread that's about to run
 	if (p->state == Ready) {
@@ -241,9 +302,13 @@ void gt_stop(void) {
 }
 
 // create new thread by providing pointer to function that will act like "run" method
-int gt_create(void (*f)(void)) {
+int gt_create(void (*f)(void), int priority) {
 	char *stack;
 	struct gt *p;
+
+	// Validate priority
+	if (priority < MinPriority) priority = MinPriority;
+	if (priority > MaxPriority) priority = MaxPriority;
 
 	for (p = &gt_table[0];; p++) // find an empty slot
 		if (p == &gt_table[MaxGThreads])
@@ -261,6 +326,9 @@ int gt_create(void (*f)(void)) {
 	*(uint64_t *) &stack[StackSize - 16] = (uint64_t) f; //  put provided function as a main "run" function
 	p->ctx.rsp = (uint64_t) &stack[StackSize - 16]; //  set stack pointer
 	p->state = Ready; //  set state
+	p->priority = priority;              // Set the thread priority
+	p->original_priority = priority;     // Remember the original priority
+	p->starvation_count = 0;             // Initialize starvation counter
 	
 	// Initialize metrics for the new thread
 	init_thread_metrics(&p->metrics);
