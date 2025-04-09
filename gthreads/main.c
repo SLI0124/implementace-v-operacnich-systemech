@@ -19,7 +19,7 @@ struct thread_data {
 };
 
 // Array of thread data for each thread
-struct thread_data thread_params[MaxGThreads];
+struct thread_data thread_params[MAX_G_THREADS];
 
 // Thread function that works for any priority level
 void worker_thread(void) {
@@ -27,7 +27,7 @@ void worker_thread(void) {
     static int thread_index = 0;
     int my_index = thread_index++;
     
-    if (my_index >= MaxGThreads) {
+    if (my_index >= MAX_G_THREADS) {
         printf("ERROR: Thread index out of bounds!\n");
         return;
     }

@@ -1,8 +1,8 @@
 enum {
-	MaxGThreads = 5, // Maximum number of threads, used as array size for gttbl
-	StackSize = 0x400000, // Size of stack of each thread
-	MaxPriority = 10, // Maximum priority value (lowest priority)
-	MinPriority = 0,  // Minimum priority value (highest priority)
+	MAX_G_THREADS = 5, // Maximum number of threads, used as array size for gttbl
+	STACK_SIZE = 0x400000, // Size of stack of each thread
+	MAX_PRIORITY = 10, // Maximum priority value (lowest priority)
+	MIN_PRIORITY = 0,  // Minimum priority value (highest priority)
 };
 
 // Thread performance tracking structure

@@ -58,7 +58,7 @@ void gt_print_stats() {
            "ID", "Status", "Priority", "Original", "Exec Time(μs)", "Wait Time(μs)", "Avg Exec", "Avg Wait");
     printf("---------------------------------------------------------------------\n");
     
-    for (int i = 0; i < MaxGThreads; i++) {
+    for (int i = 0; i < MAX_G_THREADS; i++) {
         struct gt *thread = &gt_table[i];
         
         // Skip completely unused threads
@@ -100,7 +100,7 @@ void gt_print_stats() {
     }
     
     printf("\n--- Detailed Statistics ---\n");
-    for (int i = 0; i < MaxGThreads; i++) {
+    for (int i = 0; i < MAX_G_THREADS; i++) {
         struct gt *thread = &gt_table[i];
         if (thread->state != Unused || thread->metrics.exec_periods > 0) {
             // Calculate variance if we have enough data points
@@ -204,19 +204,19 @@ bool gt_schedule(void) {
 	}
 	
 	// Increment starvation counter for all Ready threads
-	for (p = &gt_table[0]; p < &gt_table[MaxGThreads]; p++) {
+	for (p = &gt_table[0]; p < &gt_table[MAX_G_THREADS]; p++) {
 		if (p->state == Ready) {
 			p->starvation_count++;
 			// The more it starves, the higher its priority becomes
 			// Starving threads now get priority boost much faster
 			int new_priority = p->original_priority - p->starvation_count;
-			if (new_priority < MinPriority) new_priority = MinPriority;
+			if (new_priority < MIN_PRIORITY) new_priority = MIN_PRIORITY;
 			p->priority = new_priority;
 			
 			// If a thread has been starving for too long, force it to run next
 			if (p->starvation_count > 10) {
 				// Super boost - give it highest priority plus a bonus
-				p->priority = MinPriority - 1;  // Even higher than normal highest priority
+				p->priority = MIN_PRIORITY - 1;  // Even higher than normal highest priority
 			}
 		}
 	}
@@ -226,7 +226,7 @@ bool gt_schedule(void) {
 	int max_starvation = -1;  // Track the thread with the most starvation
 	
 	// First, check if any thread has critical starvation (force it to run)
-	for (p = &gt_table[0]; p < &gt_table[MaxGThreads]; p++) {
+	for (p = &gt_table[0]; p < &gt_table[MAX_G_THREADS]; p++) {
 		if (p->state == Ready && p->starvation_count > 10 && p->starvation_count > max_starvation) {
 			selected_thread = p;
 			max_starvation = p->starvation_count;
@@ -238,12 +238,12 @@ bool gt_schedule(void) {
 	if (!thread_found) {
 		// Use round-robin within each priority level for fairness
 		// Start searching from the thread after the last scheduled one
-		int start_idx = (round_robin_index + 1) % MaxGThreads;
+		int start_idx = (round_robin_index + 1) % MAX_G_THREADS;
 		
 		// First search loop - look for highest priority thread starting from round_robin_index
-		for (int current_priority = MinPriority; current_priority <= MaxPriority && !thread_found; current_priority++) {
-			for (int i = 0; i < MaxGThreads && !thread_found; i++) {
-				int idx = (start_idx + i) % MaxGThreads;
+		for (int current_priority = MIN_PRIORITY; current_priority <= MAX_PRIORITY && !thread_found; current_priority++) {
+			for (int i = 0; i < MAX_G_THREADS && !thread_found; i++) {
+				int idx = (start_idx + i) % MAX_G_THREADS;
 				p = &gt_table[idx];
 				if (p->state == Ready && p->priority == current_priority) {
 					selected_thread = p;
@@ -307,24 +307,24 @@ int gt_create(void (*f)(void), int priority) {
 	struct gt *p;
 
 	// Validate priority
-	if (priority < MinPriority) priority = MinPriority;
-	if (priority > MaxPriority) priority = MaxPriority;
+	if (priority < MIN_PRIORITY) priority = MIN_PRIORITY;
+	if (priority > MAX_PRIORITY) priority = MAX_PRIORITY;
 
 	for (p = &gt_table[0];; p++) // find an empty slot
-		if (p == &gt_table[MaxGThreads])
+		if (p == &gt_table[MAX_G_THREADS])
 			// if we have reached the end, gt_table is full and we cannot create a new thread
 			return -1;
 		else if (p->state == Unused)
 			break; // new slot was found
 
-	stack = malloc(StackSize); // allocate memory for stack of newly created thread
+	stack = malloc(STACK_SIZE); // allocate memory for stack of newly created thread
 	if (!stack)
 		return -1;
 
-	*(uint64_t *) &stack[StackSize - 8] = (uint64_t) gt_stop;
+	*(uint64_t *) &stack[STACK_SIZE - 8] = (uint64_t) gt_stop;
 	//  put into the stack returning function gt_stop in case function calls return
-	*(uint64_t *) &stack[StackSize - 16] = (uint64_t) f; //  put provided function as a main "run" function
-	p->ctx.rsp = (uint64_t) &stack[StackSize - 16]; //  set stack pointer
+	*(uint64_t *) &stack[STACK_SIZE - 16] = (uint64_t) f; //  put provided function as a main "run" function
+	p->ctx.rsp = (uint64_t) &stack[STACK_SIZE - 16]; //  set stack pointer
 	p->state = Ready; //  set state
 	p->priority = priority;              // Set the thread priority
 	p->original_priority = priority;     // Remember the original priority
