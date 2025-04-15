@@ -1,3 +1,17 @@
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <unistd.h>
+#include <errno.h>
+#include <time.h>
+#include <sys/time.h>
+#include <limits.h>
+#include <bits/sigaction.h>
+#include <bits/types/sigset_t.h>
+
 enum {
 	MAX_G_THREADS = 5, // Maximum number of threads, used as array size for gttbl
 	STACK_SIZE = 0x400000, // Size of stack of each thread

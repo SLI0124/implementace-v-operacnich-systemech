@@ -1,20 +1,4 @@
-#include <assert.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <signal.h>
-#include <unistd.h>
-#include <errno.h>
-#include <time.h>
-#include <sys/time.h>
-#include <limits.h>
-
 #include "gthr.h"
-
-#include <bits/sigaction.h>
-#include <bits/types/sigset_t.h>
-
 #include "gthr_struct.h"
 
 // Calculate microseconds between two timevals
