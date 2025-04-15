@@ -20,6 +20,14 @@ enum {
 	MAX_TICKETS = 100, // Maximum number of tickets per thread for lottery scheduling
 };
 
+// Thread data structure to pass parameters to threads
+struct thread_data {
+    int id;
+    int priority;
+	int tickets;
+    const char* label;
+};
+
 // Available scheduling algorithms
 enum gt_scheduler_type {
     GT_SCHED_RR,  // Round Robin scheduler

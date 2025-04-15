@@ -12,13 +12,6 @@
 
 #include "gthr.h"
 
-// Thread data structure to pass parameters to threads
-struct thread_data {
-    int id;
-    int priority;
-    const char* label;
-};
-
 // Array of thread data for each thread
 struct thread_data thread_params[MAX_G_THREADS];
 
@@ -78,22 +71,22 @@ int main(int argc, char *argv[]) {
     thread_params[0].id = 1;
     thread_params[0].priority = 0;
     thread_params[0].label = "HIGH";
-    gt_create(worker_thread, 0);
+    gt_create(worker_thread, thread_params[0].priority);
     
     thread_params[1].id = 2;
     thread_params[1].priority = 0;
     thread_params[1].label = "HIGH";
-    gt_create(worker_thread, 0);
+    gt_create(worker_thread, thread_params[1].priority);
     
     thread_params[2].id = 3;
     thread_params[2].priority = 5;
     thread_params[2].label = "MED ";
-    gt_create(worker_thread, 5);
+    gt_create(worker_thread, thread_params[2].priority);
     
     thread_params[3].id = 4;
     thread_params[3].priority = 10;
     thread_params[3].label = "LOW ";
-    gt_create(worker_thread, 10);
+    gt_create(worker_thread, thread_params[3].priority);
         
     gt_return(1);  // Wait until all threads terminate
 }
