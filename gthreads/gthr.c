@@ -28,13 +28,6 @@ static void init_thread_metrics(struct gt_metrics *m) {
     m->wait_periods = 0;
 }
 
-// Map priority to lottery tickets
-static int priority_to_tickets(int priority) {
-    // Invert priority since lower number means higher priority
-    // Give more tickets to higher priority threads (lower priority value)
-    return MAX_TICKETS - (priority * (MAX_TICKETS / (MAX_PRIORITY + 1))); // +1 to avoid division by zero
-}
-
 // Seed the random number generator if it hasn't been initialized yet
 static void ensure_random_initialized() {
     static bool initialized = false;
@@ -328,7 +321,7 @@ void gt_init(void) {
 	init_thread_metrics(&gt_current->metrics);
 	
 	// Initialize tickets for the main thread (if we're using lottery scheduling)
-	gt_current->tickets = priority_to_tickets(MIN_PRIORITY);
+	gt_current->tickets = gt_current->tickets > 0 ? gt_current->tickets : 1; // Ensure at least 1 ticket
 	
 	// Initialize random generator for lottery scheduling
 	ensure_random_initialized();
@@ -425,11 +418,12 @@ void gt_stop(void) {
 }
 
 // create new thread by providing pointer to function that will act like "run" method
-int gt_create(void (*f)(void), int priority) {
+int gt_create(void (*f)(void), struct thread_data *data) {
 	char *stack;
 	struct gt *p;
 
 	// Validate priority
+	int priority = data->priority;
 	if (priority < MIN_PRIORITY) priority = MIN_PRIORITY;
 	if (priority > MAX_PRIORITY) priority = MAX_PRIORITY;
 
@@ -453,8 +447,8 @@ int gt_create(void (*f)(void), int priority) {
 	p->original_priority = priority;     // Remember the original priority
 	p->starvation_count = 0;             // Initialize starvation counter
 	
-	// Set lottery tickets based on priority
-	p->tickets = priority_to_tickets(priority);
+	// Set lottery tickets from thread_data 
+	p->tickets = data->tickets > 0 ? data->tickets : 1; // Ensure at least 1 ticket
 	
 	// Initialize metrics for the new thread
 	init_thread_metrics(&p->metrics);

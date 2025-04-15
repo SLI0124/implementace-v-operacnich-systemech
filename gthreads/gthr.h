@@ -95,7 +95,7 @@ void gt_return(int ret); // terminate thread
 void gt_switch(struct gt_context *old, struct gt_context *new); // declaration from gtswtch.S
 bool gt_schedule(void); // yield and switch to another thread
 void gt_stop(void); // terminate current thread
-int gt_create(void (*f)(void), int priority); // create new thread with given priority
+int gt_create(void (*f)(void), struct thread_data *data); // create new thread with given thread data
 void gt_reset_sig(int sig); // resets signal
 void gt_alarm_handle(int sig); // periodically triggered by alarm
 int gt_uninterruptible_nanosleep(time_t sec, long nanosec); // uninterruptible sleep

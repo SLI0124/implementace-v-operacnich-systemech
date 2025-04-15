@@ -67,26 +67,30 @@ int main(int argc, char *argv[]) {
     
     gt_init();  // Initialize threads
     
-    // Create threads with different priorities
+    // Create threads with different priorities and configurations
     thread_params[0].id = 1;
-    thread_params[0].priority = 0;
+    thread_params[0].priority = 0;  // Highest priority
+    thread_params[0].tickets = 50;  // High number of tickets for lottery scheduling
     thread_params[0].label = "HIGH";
-    gt_create(worker_thread, thread_params[0].priority);
+    gt_create(worker_thread, &thread_params[0]);
     
     thread_params[1].id = 2;
-    thread_params[1].priority = 0;
+    thread_params[1].priority = 0;  // Also highest priority
+    thread_params[1].tickets = 30;  // Medium number of tickets
     thread_params[1].label = "HIGH";
-    gt_create(worker_thread, thread_params[1].priority);
+    gt_create(worker_thread, &thread_params[1]);
     
     thread_params[2].id = 3;
-    thread_params[2].priority = 5;
+    thread_params[2].priority = 5;  // Medium priority
+    thread_params[2].tickets = 15;  // Fewer tickets
     thread_params[2].label = "MED ";
-    gt_create(worker_thread, thread_params[2].priority);
+    gt_create(worker_thread, &thread_params[2]);
     
     thread_params[3].id = 4;
-    thread_params[3].priority = 10;
+    thread_params[3].priority = 10; // Lowest priority
+    thread_params[3].tickets = 5;   // Very few tickets
     thread_params[3].label = "LOW ";
-    gt_create(worker_thread, thread_params[3].priority);
+    gt_create(worker_thread, &thread_params[3]);
         
     gt_return(1);  // Wait until all threads terminate
 }
