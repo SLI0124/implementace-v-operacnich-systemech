@@ -3,6 +3,14 @@ enum {
 	STACK_SIZE = 0x400000, // Size of stack of each thread
 	MAX_PRIORITY = 10, // Maximum priority value (lowest priority)
 	MIN_PRIORITY = 0,  // Minimum priority value (highest priority)
+	MAX_TICKETS = 100, // Maximum number of tickets per thread for lottery scheduling
+};
+
+// Available scheduling algorithms
+enum gt_scheduler_type {
+    GT_SCHED_RR,  // Round Robin scheduler
+    GT_SCHED_PRI, // Priority scheduler
+    GT_SCHED_LS   // Lottery scheduler
 };
 
 // Thread performance tracking structure
@@ -54,6 +62,9 @@ struct gt {
 	int starvation_count;
 	// Performance tracking data
 	struct gt_metrics metrics;
+    
+    // Number of lottery tickets for the lottery scheduler
+    int tickets;
 };
 
 
@@ -67,3 +78,4 @@ void gt_reset_sig(int sig); // resets signal
 void gt_alarm_handle(int sig); // periodically triggered by alarm
 int gt_uninterruptible_nanosleep(time_t sec, long nanosec); // uninterruptible sleep
 void gt_print_stats();
+void gt_set_scheduler(enum gt_scheduler_type sched_type); // set the scheduling algorithm

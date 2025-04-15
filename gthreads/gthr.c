@@ -44,6 +44,116 @@ static void init_thread_metrics(struct gt_metrics *m) {
     m->wait_periods = 0;
 }
 
+// Map priority to lottery tickets
+static int priority_to_tickets(int priority) {
+    // Invert priority since lower number means higher priority
+    // Give more tickets to higher priority threads (lower priority value)
+    return MAX_TICKETS - (priority * (MAX_TICKETS / (MAX_PRIORITY + 1)));
+}
+
+// Seed the random number generator if it hasn't been initialized yet
+static void ensure_random_initialized() {
+    static bool initialized = false;
+    if (!initialized) {
+        srand(time(NULL));
+        initialized = true;
+    }
+}
+
+// Get a thread using lottery scheduling algorithm
+static struct gt* lottery_schedule() {
+    ensure_random_initialized();
+    
+    // Count total tickets of all Ready threads
+    int total_tickets = 0;
+    struct gt *p;
+    for (p = &gt_table[0]; p < &gt_table[MAX_G_THREADS]; p++) {
+        if (p->state == Ready) {
+            total_tickets += p->tickets;
+        }
+    }
+    
+    // If no tickets (no ready threads), return NULL
+    if (total_tickets == 0) {
+        return NULL;
+    }
+    
+    // Select a random ticket
+    int winning_ticket = rand() % total_tickets;
+    
+    // Find the thread that owns this ticket
+    int ticket_counter = 0;
+    for (p = &gt_table[0]; p < &gt_table[MAX_G_THREADS]; p++) {
+        if (p->state == Ready) {
+            ticket_counter += p->tickets;
+            if (winning_ticket < ticket_counter) {
+                return p;
+            }
+        }
+    }
+    
+    // Should never reach here if we have ready threads
+    return NULL;
+}
+
+// Get a thread using priority-based scheduling with starvation prevention
+static struct gt* priority_schedule() {
+    struct gt *p;
+    struct gt *selected_thread = NULL;
+    int max_starvation = -1;
+    bool thread_found = false;
+    static int round_robin_index = 0;
+    
+    // First, check if any thread has critical starvation (force it to run)
+    for (p = &gt_table[0]; p < &gt_table[MAX_G_THREADS]; p++) {
+        if (p->state == Ready && p->starvation_count > 10 && p->starvation_count > max_starvation) {
+            selected_thread = p;
+            max_starvation = p->starvation_count;
+            thread_found = true;
+        }
+    }
+    
+    // If no critically starving thread, use priority-based scheduling
+    if (!thread_found) {
+        // Use round-robin within each priority level for fairness
+        // Start searching from the thread after the last scheduled one
+        int start_idx = (round_robin_index + 1) % MAX_G_THREADS;
+        
+        // Search for highest priority thread starting from round_robin_index
+        for (int current_priority = MIN_PRIORITY; current_priority <= MAX_PRIORITY && !thread_found; current_priority++) {
+            for (int i = 0; i < MAX_G_THREADS && !thread_found; i++) {
+                int idx = (start_idx + i) % MAX_G_THREADS;
+                p = &gt_table[idx];
+                if (p->state == Ready && p->priority == current_priority) {
+                    selected_thread = p;
+                    round_robin_index = idx;  // Update for next scheduling decision
+                    thread_found = true;
+                }
+            }
+        }
+    }
+    
+    return selected_thread;
+}
+
+// Get a thread using simple round-robin scheduling
+static struct gt* round_robin_schedule() {
+    static int round_robin_index = 0;
+    struct gt *p;
+    int start_idx = (round_robin_index + 1) % MAX_G_THREADS;
+    
+    for (int i = 0; i < MAX_G_THREADS; i++) {
+        int idx = (start_idx + i) % MAX_G_THREADS;
+        p = &gt_table[idx];
+        if (p->state == Ready) {
+            round_robin_index = idx;
+            return p;
+        }
+    }
+    
+    return NULL;
+}
+
 // function triggered periodically by timer (SIGALRM)
 void gt_alarm_handle(int sig) {
 	gt_schedule();
@@ -54,9 +164,18 @@ void gt_print_stats() {
     gettimeofday(&current_time, NULL);
     
     printf("\n================ Thread Performance Report ================\n");
-    printf("%-4s | %-8s | %-8s | %-8s | %-12s | %-12s | %-10s | %-10s\n", 
-           "ID", "Status", "Priority", "Original", "Exec Time(μs)", "Wait Time(μs)", "Avg Exec", "Avg Wait");
-    printf("---------------------------------------------------------------------\n");
+    const char* scheduler_name;
+    switch (gt_current_scheduler) {
+        case GT_SCHED_RR: scheduler_name = "Round Robin"; break;
+        case GT_SCHED_PRI: scheduler_name = "Priority-based"; break;
+        case GT_SCHED_LS: scheduler_name = "Lottery Scheduling"; break;
+        default: scheduler_name = "Unknown";
+    }
+    printf("Current scheduler: %s\n\n", scheduler_name);
+    
+    printf("%-4s | %-8s | %-8s | %-8s | %-8s | %-12s | %-12s | %-10s | %-10s\n", 
+           "ID", "Status", "Priority", "Original", "Tickets", "Exec Time(μs)", "Wait Time(μs)", "Avg Exec", "Avg Wait");
+    printf("---------------------------------------------------------------------------------\n");
     
     for (int i = 0; i < MAX_G_THREADS; i++) {
         struct gt *thread = &gt_table[i];
@@ -93,9 +212,10 @@ void gt_print_stats() {
             thread->state == Running ? "Running" : 
             thread->state == Ready ? "Ready" : "Unused";
         
-        printf("%-4d | %-8s | %-8d | %-8d | %-12lu | %-12lu | %-10.2f | %-10.2f\n", 
+        printf("%-4d | %-8s | %-8d | %-8d | %-8d | %-12lu | %-12lu | %-10.2f | %-10.2f\n", 
                i, state_str, 
                thread->priority, thread->original_priority,
+               thread->tickets,
                total_exec, total_wait, avg_exec, avg_wait);
     }
     
@@ -117,8 +237,8 @@ void gt_print_stats() {
             }
             
             printf("Thread %d:\n", i);
-            printf("  Priority: %d (Original: %d), Starvation count: %d\n", 
-                   thread->priority, thread->original_priority, thread->starvation_count);
+            printf("  Priority: %d (Original: %d), Tickets: %d, Starvation count: %d\n", 
+                   thread->priority, thread->original_priority, thread->tickets, thread->starvation_count);
             printf("  RSP: 0x%lx\n", thread->ctx.rsp);
             printf("  Execution: min=%lu μs, max=%lu μs, periods=%u, variance=%.2f\n",
                    thread->metrics.exec_shortest == ULONG_MAX ? 0 : thread->metrics.exec_shortest,
@@ -135,6 +255,11 @@ void gt_print_stats() {
     printf("===============================================================\n");
 }
 
+// Set the current scheduler type for initialization in main.c
+void gt_set_scheduler(enum gt_scheduler_type sched_type) {
+    gt_current_scheduler = sched_type;
+}
+
 // initialize first thread as current context
 void gt_init(void) {
 	gt_current = &gt_table[0]; // initialize current thread with thread #0
@@ -142,6 +267,12 @@ void gt_init(void) {
 	
 	// Initialize metrics for the main thread
 	init_thread_metrics(&gt_current->metrics);
+	
+	// Initialize tickets for the main thread (if we're using lottery scheduling)
+	gt_current->tickets = priority_to_tickets(MIN_PRIORITY);
+	
+	// Initialize random generator for lottery scheduling
+	ensure_random_initialized();
 	
 	signal(SIGALRM, gt_alarm_handle); // register SIGALRM, signal from timer generated by alarm
 	signal(SIGINT, gt_print_stats);   // register SIGINT handler for statistics display
@@ -174,8 +305,6 @@ bool gt_schedule(void) {
 	struct gt_context *old, *new;
 	struct timeval switch_time;
 	gettimeofday(&switch_time, NULL);
-	bool thread_found = false;
-	static int round_robin_index = 0;  // Index to start our search from (for round-robin fairness)
 
 	gt_reset_sig(SIGALRM); // reset signal
 
@@ -199,67 +328,58 @@ bool gt_schedule(void) {
 	// First reset starvation counter for current thread if it was running
 	if (gt_current->state == Running) {
 		gt_current->starvation_count = 0;
-		// Reset the thread's priority to its original value
-		gt_current->priority = gt_current->original_priority;
+        
+        // Reset the thread's priority to its original value if using priority scheduler
+		if (gt_current_scheduler == GT_SCHED_PRI) {
+		    gt_current->priority = gt_current->original_priority;
+		}
 	}
 	
 	// Increment starvation counter for all Ready threads
 	for (p = &gt_table[0]; p < &gt_table[MAX_G_THREADS]; p++) {
 		if (p->state == Ready) {
 			p->starvation_count++;
-			// The more it starves, the higher its priority becomes
-			// Starving threads now get priority boost much faster
-			int new_priority = p->original_priority - p->starvation_count;
-			if (new_priority < MIN_PRIORITY) new_priority = MIN_PRIORITY;
-			p->priority = new_priority;
 			
-			// If a thread has been starving for too long, force it to run next
-			if (p->starvation_count > 10) {
-				// Super boost - give it highest priority plus a bonus
-				p->priority = MIN_PRIORITY - 1;  // Even higher than normal highest priority
-			}
+            // Only adjust priority dynamically for priority-based scheduling
+            if (gt_current_scheduler == GT_SCHED_PRI) {
+                // The more it starves, the higher its priority becomes
+                int new_priority = p->original_priority - p->starvation_count;
+                if (new_priority < MIN_PRIORITY) new_priority = MIN_PRIORITY;
+                p->priority = new_priority;
+                
+                // If a thread has been starving for too long, force it to run next
+                if (p->starvation_count > 10) {
+                    // Super boost - give it highest priority plus a bonus
+                    p->priority = MIN_PRIORITY - 1;  // Even higher than normal highest priority
+                }
+            }
 		}
 	}
 	
-	// Find next thread to run based on priority
-	struct gt *selected_thread = NULL;
-	int max_starvation = -1;  // Track the thread with the most starvation
-	
-	// First, check if any thread has critical starvation (force it to run)
-	for (p = &gt_table[0]; p < &gt_table[MAX_G_THREADS]; p++) {
-		if (p->state == Ready && p->starvation_count > 10 && p->starvation_count > max_starvation) {
-			selected_thread = p;
-			max_starvation = p->starvation_count;
-			thread_found = true;
-		}
-	}
-	
-	// If no critically starving thread, use priority-based scheduling
-	if (!thread_found) {
-		// Use round-robin within each priority level for fairness
-		// Start searching from the thread after the last scheduled one
-		int start_idx = (round_robin_index + 1) % MAX_G_THREADS;
-		
-		// First search loop - look for highest priority thread starting from round_robin_index
-		for (int current_priority = MIN_PRIORITY; current_priority <= MAX_PRIORITY && !thread_found; current_priority++) {
-			for (int i = 0; i < MAX_G_THREADS && !thread_found; i++) {
-				int idx = (start_idx + i) % MAX_G_THREADS;
-				p = &gt_table[idx];
-				if (p->state == Ready && p->priority == current_priority) {
-					selected_thread = p;
-					round_robin_index = idx;  // Update for next scheduling decision
-					thread_found = true;
-				}
-			}
-		}
-	}
+    // Choose next thread to run based on current scheduler type
+    p = NULL;
+    switch (gt_current_scheduler) {
+        case GT_SCHED_RR:
+            p = round_robin_schedule();
+            break;
+            
+        case GT_SCHED_PRI:
+            p = priority_schedule();
+            break;
+            
+        case GT_SCHED_LS:
+            p = lottery_schedule();
+            break;
+            
+        default:
+            fprintf(stderr, "Error: Unknown scheduler type\n");
+            return false;
+    }
 	
 	// If no Ready thread was found, return false
-	if (!selected_thread) {
+	if (!p) {
 		return false;
 	}
-	
-	p = selected_thread;
 
 	// Update wait time for the thread that's about to run
 	if (p->state == Ready) {
@@ -329,6 +449,9 @@ int gt_create(void (*f)(void), int priority) {
 	p->priority = priority;              // Set the thread priority
 	p->original_priority = priority;     // Remember the original priority
 	p->starvation_count = 0;             // Initialize starvation counter
+	
+	// Set lottery tickets based on priority
+	p->tickets = priority_to_tickets(priority);
 	
 	// Initialize metrics for the new thread
 	init_thread_metrics(&p->metrics);

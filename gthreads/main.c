@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <string.h>
 
 #include "gthr.h"
 
@@ -50,7 +51,27 @@ void worker_thread(void) {
     }
 }
 
-int main(void) {    
+
+int main(int argc, char *argv[]) {    
+    if (argc > 1) {
+        if (strcmp(argv[1], "-r") == 0 || strcmp(argv[1], "--rr") == 0) {
+            gt_set_scheduler(GT_SCHED_RR);
+            printf("Using Round Robin scheduler\n");
+        } else if (strcmp(argv[1], "-p") == 0 || strcmp(argv[1], "--prio") == 0) {
+            gt_set_scheduler(GT_SCHED_PRI);
+            printf("Using Priority-based scheduler\n");
+        } else if (strcmp(argv[1], "-l") == 0 || strcmp(argv[1], "--lottery") == 0) {
+            gt_set_scheduler(GT_SCHED_LS);
+            printf("Using Lottery Scheduling\n");
+        } else {
+            printf("Invalid argument. Use -r for Round Robin, -p for Priority, or -l for Lottery.\n");
+            return 1;
+        }
+    } else {
+        gt_set_scheduler(GT_SCHED_PRI);
+        printf("Using default Priority-based scheduler\n");
+    }
+    
     gt_init();  // Initialize threads
     
     // Create threads with different priorities
@@ -73,6 +94,6 @@ int main(void) {
     thread_params[3].priority = 10;
     thread_params[3].label = "LOW ";
     gt_create(worker_thread, 10);
-    
+        
     gt_return(1);  // Wait until all threads terminate
 }
