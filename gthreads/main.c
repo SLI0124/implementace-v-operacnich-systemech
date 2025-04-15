@@ -12,8 +12,8 @@
 
 #include "gthr.h"
 
-// Array of thread data for each thread
-struct thread_data thread_params[MAX_G_THREADS];
+// Use extern declaration - the actual definition is in gthr_params.c for better organization
+extern struct thread_data thread_params[MAX_G_THREADS];
 
 // Thread function that works for any priority level
 void worker_thread(void) {

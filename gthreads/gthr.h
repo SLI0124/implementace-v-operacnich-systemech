@@ -18,6 +18,7 @@ enum {
 	MAX_PRIORITY = 10, // Maximum priority value (lowest priority)
 	MIN_PRIORITY = 0,  // Minimum priority value (highest priority)
 	MAX_TICKETS = 100, // Maximum number of tickets per thread for lottery scheduling
+	MAX_BLOCKED_THREADS = MAX_G_THREADS, // Maximum number of threads that can be blocked on a semaphore
 };
 
 // Thread data structure to pass parameters to threads
@@ -27,6 +28,18 @@ struct thread_data {
 	int tickets;
     const char* label;
 };
+
+// External declaration of thread parameters array used across files
+extern struct thread_data thread_params[MAX_G_THREADS];
+
+// Semaphore structure with FIFO queue
+typedef struct {
+    int value;                          // Current value of the semaphore
+    int wait_count;                     // Number of threads waiting on this semaphore
+    struct gt *wait_queue[MAX_BLOCKED_THREADS]; // Queue of waiting threads (FIFO)
+    int head;                           // Head of the queue
+    int tail;                           // Tail of the queue
+} gt_semaphore_t;
 
 // Available scheduling algorithms
 enum gt_scheduler_type {
@@ -74,6 +87,7 @@ struct gt {
 		Unused,
 		Running,
 		Ready,
+		Blocked,  // New state for blocked threads
 	} state;
 	
 	// Thread priority (0 = highest, 10 = lowest)
@@ -101,3 +115,8 @@ void gt_alarm_handle(int sig); // periodically triggered by alarm
 int gt_uninterruptible_nanosleep(time_t sec, long nanosec); // uninterruptible sleep
 void gt_print_stats();
 void gt_set_scheduler(enum gt_scheduler_type sched_type); // set the scheduling algorithm
+
+// Semaphore operations
+void gt_sem_init(gt_semaphore_t* sem, int initial_value); // initialize semaphore
+void gt_sem_wait(gt_semaphore_t* sem);  // P operation (wait)
+void gt_sem_post(gt_semaphore_t* sem);  // V operation (signal)

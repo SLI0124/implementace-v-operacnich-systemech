@@ -1,6 +1,9 @@
 #include "gthr.h"
 #include "gthr_struct.h"
 
+// Use the extern declaration from gthr.h, not defining it here
+extern struct thread_data thread_params[MAX_G_THREADS];
+
 // Calculate microseconds between two timevals
 static unsigned long time_elapsed_us(struct timeval *start, struct timeval *end) {
     return (end->tv_sec - start->tv_sec) * 1000000 + (end->tv_usec - start->tv_usec);
@@ -34,6 +37,57 @@ static void ensure_random_initialized() {
     if (!initialized) {
         srand(time(NULL));
         initialized = true;
+    }
+}
+
+// Semaphore initialization
+void gt_sem_init(gt_semaphore_t* sem, int initial_value) {
+    sem->value = initial_value;
+    sem->wait_count = 0;
+    sem->head = 0;
+    sem->tail = 0;
+}
+
+// P operation (wait)
+void gt_sem_wait(gt_semaphore_t* sem) {
+    sem->value--;
+    
+    if (sem->value < 0) {
+        // Need to block the current thread
+        printf("%s priority thread id = %d BLOCKED on semaphore\n", 
+               thread_params[gt_current->original_priority].label, 
+               thread_params[gt_current->original_priority].id);
+               
+        // Add thread to the semaphore wait queue
+        sem->wait_queue[sem->tail] = gt_current;
+        sem->tail = (sem->tail + 1) % MAX_BLOCKED_THREADS;
+        sem->wait_count++;
+        
+        // Mark thread as blocked
+        gt_current->state = Blocked;
+        
+        // Force a context switch
+        gt_schedule();
+    }
+}
+
+// V operation (signal)
+void gt_sem_post(gt_semaphore_t* sem) {
+    sem->value++;
+    
+    if (sem->value <= 0 && sem->wait_count > 0) {
+        // Wake up a waiting thread
+        struct gt *thread_to_wake = sem->wait_queue[sem->head];
+        sem->head = (sem->head + 1) % MAX_BLOCKED_THREADS;
+        sem->wait_count--;
+        
+        // Move thread from Blocked to Ready state
+        thread_to_wake->state = Ready;
+        gettimeofday(&thread_to_wake->metrics.ready_start_time, NULL);
+        
+        printf("%s priority thread id = %d UNBLOCKED from semaphore\n", 
+               thread_params[thread_to_wake->original_priority].label, 
+               thread_params[thread_to_wake->original_priority].id);
     }
 }
 
@@ -262,7 +316,8 @@ void gt_print_stats() {
         // Thread state string
         const char *state_str = 
             thread->state == Running ? "Running" : 
-            thread->state == Ready ? "Ready" : "Unused";
+            thread->state == Ready ? "Ready" : 
+            thread->state == Blocked ? "Blocked" : "Unused";
         
         printf("%-4d | %-8s | %-8d | %-8d | %-8d | %-12lu | %-12lu | %-10.2f | %-10.2f\n", 
                i, state_str, 
@@ -394,8 +449,9 @@ bool gt_schedule(void) {
 	// Update wait time for the thread that's about to run
 	update_ready_thread_metrics(p, &switch_time);
 
-	// Update current thread state
-	if (gt_current->state != Unused) {
+	// Update current thread state - only if it's not Blocked
+	// Blocked threads should stay blocked until semaphore releases them
+	if (gt_current->state != Unused && gt_current->state != Blocked) {
 		gt_current->state = Ready;
 		gettimeofday(&gt_current->metrics.ready_start_time, NULL);
 	}
