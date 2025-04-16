@@ -1,8 +1,8 @@
 #include "gthr.h"
 #include "gthr_struct.h"
 
-// Use the extern declaration from gthr.h, not defining it here
-extern struct thread_data thread_params[MAX_G_THREADS];
+// Define thread_params directly in gthr.c
+struct thread_data thread_params[MAX_G_THREADS];
 
 // Calculate microseconds between two timevals
 static unsigned long time_elapsed_us(struct timeval *start, struct timeval *end) {
@@ -54,9 +54,20 @@ void gt_sem_wait(gt_semaphore_t* sem) {
     
     if (sem->value < 0) {
         // Need to block the current thread
-        printf("%s priority thread id = %d BLOCKED on semaphore\n", 
-               thread_params[gt_current->original_priority].label, 
-               thread_params[gt_current->original_priority].id);
+        // Use a safer approach to get the thread's info
+        const char* label = "Thread";
+        int id = 0;
+        
+        // Find the thread in thread_params by using the thread's index in gt_table
+        for (int i = 0; i < MAX_G_THREADS; i++) {
+            if (gt_current == &gt_table[i]) {
+                label = thread_params[i].label;
+                id = thread_params[i].id;
+                break;
+            }
+        }
+        
+        printf("%s priority thread id = %d BLOCKED on semaphore\n", label, id);
                
         // Add thread to the semaphore wait queue
         sem->wait_queue[sem->tail] = gt_current;
@@ -85,9 +96,20 @@ void gt_sem_post(gt_semaphore_t* sem) {
         thread_to_wake->state = Ready;
         gettimeofday(&thread_to_wake->metrics.ready_start_time, NULL);
         
-        printf("%s priority thread id = %d UNBLOCKED from semaphore\n", 
-               thread_params[thread_to_wake->original_priority].label, 
-               thread_params[thread_to_wake->original_priority].id);
+        // Use a safer approach to get the thread's info
+        const char* label = "Thread";
+        int id = 0;
+        
+        // Find the thread in thread_params by using the thread's index in gt_table
+        for (int i = 0; i < MAX_G_THREADS; i++) {
+            if (thread_to_wake == &gt_table[i]) {
+                label = thread_params[i].label;
+                id = thread_params[i].id;
+                break;
+            }
+        }
+        
+        printf("%s priority thread id = %d UNBLOCKED from semaphore\n", label, id);
     }
 }
 

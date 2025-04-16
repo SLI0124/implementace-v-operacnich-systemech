@@ -3,10 +3,10 @@ LDLIBS = -lm
 
 all: gthr_demo semaphore_test
 
-gthr_demo: gthr.o gthr_switch.o main.o gthr_params.o
+gthr_demo: gthr.o gthr_switch.o main.o
 	$(CC) -o $@ $^ $(LDLIBS)
 
-semaphore_test: gthr.o gthr_switch.o semaphore_test.o gthr_params.o
+semaphore_test: gthr.o gthr_switch.o semaphore_test.o
 	$(CC) -o $@ $^ $(LDLIBS)
 
 .S.o:

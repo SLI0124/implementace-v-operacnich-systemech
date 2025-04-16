@@ -29,9 +29,6 @@ struct thread_data {
     const char* label;
 };
 
-// External declaration of thread parameters array used across files
-extern struct thread_data thread_params[MAX_G_THREADS];
-
 // Semaphore structure with FIFO queue
 typedef struct {
     int value;                          // Current value of the semaphore
