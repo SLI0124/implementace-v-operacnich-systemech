@@ -110,7 +110,7 @@ int gt_create(void (*f)(void), struct thread_data *data); // create new thread w
 void gt_reset_sig(int sig); // resets signal
 void gt_alarm_handle(int sig); // periodically triggered by alarm
 int gt_uninterruptible_nanosleep(time_t sec, long nanosec); // uninterruptible sleep
-void gt_print_stats();
+void gt_print_stats(int sig); // print thread statistics - takes signal parameter for compatibility
 void gt_set_scheduler(enum gt_scheduler_type sched_type); // set the scheduling algorithm
 
 // Semaphore operations

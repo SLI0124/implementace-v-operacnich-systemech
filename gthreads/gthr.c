@@ -287,7 +287,8 @@ void gt_alarm_handle(int sig) {
 	gt_schedule();
 }
 
-void gt_print_stats() {
+// Print thread statistics
+void gt_print_stats(int sig) {
     struct timeval current_time;
     gettimeofday(&current_time, NULL);
     
