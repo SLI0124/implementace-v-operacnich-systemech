@@ -701,58 +701,9 @@ int main() {
     return 1;
   }
   
-  // 1. Print directory tree to stderr as requested in the assignment
-  fprintf(stderr, "Directory Tree (using printTree function):\n");
-  printTree();
+  printf("\nEntering interactive mode. Type 'exit' to quit.\n");
+  printf("Available commands: cd, ls, cat, save, tree, exit\n");
   
-  // 2. List root directory contents
-  printf("\nFilesystem root directory listing\n-----------------------\n");
-  printf(" Volume in drive: %.11s\n", fs.bs.volume_label);
-  printf(" Directory of root:\n\n");
-  
-  uint32_t entry_count;
-  Fat16Entry* entries = readDirectory(0, &entry_count);
-  if (entries) {
-    printDirectoryEntries(entries, entry_count);
-    free(entries);
-  }
-  
-  // 3. Change to ADR1 directory
-  printf("\nChanging to ADR1 directory...\n");
-  if (changeDir("ADR1") == 0) {
-    printf("Successfully changed to directory: %s\n", current_path);
-    
-    // 4. List ADR1 contents
-    printf("\nDirectory listing of %s\n-----------------------\n", current_path);
-    entries = readDirectory(current_dir_cluster, &entry_count);
-    if (entries) {
-      printDirectoryEntries(entries, entry_count);
-      
-      // 5. Find the first file to display
-      int i;
-      char filename[13] = {0};
-      for (i = 0; i < entry_count; i++) {
-        if (entries[i].filename[0] != 0x00 && entries[i].filename[0] != 0xE5 && 
-            !(entries[i].attributes & 0x10) && !(entries[i].attributes & 0x08)) {
-          cleanFatName(filename, entries[i].filename, entries[i].ext);
-          break;
-        }
-      }
-      
-      free(entries);
-      
-      // 6. Display the file if found
-      if (filename[0] != 0) {
-        printf("\nDisplaying content of file '%s' from %s:\n", filename, current_path);
-        catFile(fs.fp, &fs.bs, filename, fs.pt);
-      }
-    }
-  } else {
-    printf("Failed to change to ADR1 directory\n");
-  }
-  
-  // Optional interactive mode
-  printf("\n\nEntering interactive mode. Type 'exit' to quit.\n");
   char cmd[256];
   int running = 1;
   
