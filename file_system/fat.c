@@ -54,11 +54,24 @@ void cleanFatName(char* dst, const unsigned char* filename, const unsigned char*
     }
   }
   
-  // Add extension if present
-  if (ext[0] != ' ') {
+  // Add extension if present and not all spaces
+  if (ext[0] != ' ' || ext[1] != ' ' || ext[2] != ' ') {
     strcat(dst, ".");
-    for (i = 0; i < 3 && ext[i] != ' '; i++) {
-      dst[strlen(dst)] = ext[i];
+    
+    // Copy extension without trailing spaces
+    char ext_copy[4] = {0};
+    memcpy(ext_copy, ext, 3);
+    
+    // Remove control characters if any
+    for (i = 0; i < 3; i++) {
+      if (ext_copy[i] < 32 || ext_copy[i] > 126) {
+        ext_copy[i] = '_';  // Replace non-printable chars
+      }
+    }
+    
+    // Append clean extension
+    for (i = 0; i < 3 && ext_copy[i] != ' '; i++) {
+      dst[strlen(dst)] = ext_copy[i];
     }
   }
 }
@@ -82,7 +95,9 @@ void formatToFatName(const char* input, char* fname, char* ext) {
     
     strncpy(ext, dot_pos + 1, 3);
   } else {
-    strncpy(fname, input, 8);
+    name_len = strlen(input);
+    if (name_len > 8) name_len = 8;
+    strncpy(fname, input, name_len);
   }
   
   // Convert to uppercase
@@ -153,20 +168,83 @@ Fat16Entry* readDirectory(uint16_t cluster, uint32_t* entryCount) {
   return entries;
 }
 
+// Find a directory entry by name
 Fat16Entry* findEntry(Fat16Entry* dir_entries, uint32_t entry_count, const char* name) {
   char fname[9];
   char ext[4];
   int i;
   
+  // Special case for "." and ".."
+  if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+    for (i = 0; i < entry_count; i++) {
+      if (dir_entries[i].filename[0] == '.' && 
+          (dir_entries[i].filename[1] == ' ' || 
+           (strcmp(name, "..") == 0 && dir_entries[i].filename[1] == '.' && dir_entries[i].filename[2] == ' '))) {
+        return &dir_entries[i];
+      }
+    }
+    return NULL;
+  }
+  
   formatToFatName(name, fname, ext);
+  
+  // Debug printout - show what we're looking for
+  printf("Looking for directory/file: '%s' as '%.8s'.'%.3s'\n", name, fname, ext);
   
   // Search for the file/directory in entries
   for (i = 0; i < entry_count; i++) {
     if (dir_entries[i].filename[0] != 0x00 && dir_entries[i].filename[0] != 0xE5) {
-      if (memcmp(dir_entries[i].filename, fname, 8) == 0 && 
-          memcmp(dir_entries[i].ext, ext, 3) == 0) {
+      // Debug printout - show what entries we have
+      printf("Entry %d: '%.8s'.'%.3s' (attr: 0x%02X)\n", i, 
+             dir_entries[i].filename, dir_entries[i].ext, dir_entries[i].attributes);
+      
+      // For directories, compare only the filename part (ignore extension)
+      if ((dir_entries[i].attributes & 0x10) && 
+          strncmp(dir_entries[i].filename, fname, 8) == 0) {
         return &dir_entries[i];
       }
+      // For files, check both parts
+      else if (!(dir_entries[i].attributes & 0x10) && 
+               strncmp(dir_entries[i].filename, fname, 8) == 0 && 
+               strncmp(dir_entries[i].ext, ext, 3) == 0) {
+        return &dir_entries[i];
+      }
+    }
+  }
+  
+  return NULL;
+}
+
+// Better version of findEntry that correctly handles FAT16 format
+Fat16Entry* findEntryByName(Fat16Entry* entries, uint32_t entry_count, const char* name) {
+  char cleaned_name[13];
+  int i;
+  
+  // Handle special directories
+  if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+    for (i = 0; i < entry_count; i++) {
+      if (entries[i].filename[0] == '.' && 
+          ((strcmp(name, ".") == 0 && entries[i].filename[1] == ' ') || 
+           (strcmp(name, "..") == 0 && entries[i].filename[1] == '.' && entries[i].filename[2] == ' '))) {
+        return &entries[i];
+      }
+    }
+    return NULL;
+  }
+  
+  // For each directory entry
+  for (i = 0; i < entry_count; i++) {
+    // Skip deleted or empty entries
+    if (entries[i].filename[0] == 0xE5 || entries[i].filename[0] == 0x00) {
+      continue;
+    }
+    
+    // Create a cleaned name from this entry
+    cleanFatName(cleaned_name, entries[i].filename, entries[i].ext);
+    
+    // Compare in case-insensitive manner 
+    if (strcasecmp(cleaned_name, name) == 0) {
+      return &entries[i];
     }
   }
   
@@ -203,20 +281,28 @@ void printDirectoryEntries(Fat16Entry* entries, uint32_t entry_count) {
   printf("   %d File(s)    %d bytes\n", fileCount, totalSize);
 }
 
+// Revised changeDir implementation
 int changeDir(char* path) {
   uint32_t entry_count;
   Fat16Entry* entries;
   Fat16Entry* entry;
   char* token;
   char path_copy[256];
+  char temp_path[256];
+  uint16_t temp_dir_cluster = current_dir_cluster;
+  
+  // Save current state
+  strcpy(temp_path, current_path);
   
   // Handle absolute path
   if (path[0] == '/') {
-    strcpy(current_path, "/");
-    current_dir_cluster = 0; // Root directory
+    strcpy(temp_path, "/");
+    temp_dir_cluster = 0; // Root directory
     
     // If path is just "/", we're done
     if (strlen(path) == 1) {
+      current_dir_cluster = temp_dir_cluster;
+      strcpy(current_path, temp_path);
       return 0;
     }
     
@@ -229,7 +315,7 @@ int changeDir(char* path) {
   
   while (token) {
     // Get current directory entries
-    entries = readDirectory(current_dir_cluster, &entry_count);
+    entries = readDirectory(temp_dir_cluster, &entry_count);
     if (!entries) {
       return -1;
     }
@@ -237,24 +323,29 @@ int changeDir(char* path) {
     // Handle ".." (parent directory)
     if (strcmp(token, "..") == 0) {
       // If we're already at root, nothing to do
-      if (current_dir_cluster == 0) {
+      if (temp_dir_cluster == 0) {
         free(entries);
         token = strtok(NULL, "/");
         continue;
       }
       
-      // Remove the last directory from the path
-      char* last_slash = strrchr(current_path, '/');
-      if (last_slash && last_slash != current_path) {
-        *last_slash = '\0';
+      // Find the ".." entry
+      entry = findEntryByName(entries, entry_count, "..");
+      if (entry && entry->starting_cluster != 0) {
+        temp_dir_cluster = entry->starting_cluster;
       } else {
-        strcpy(current_path, "/");
+        // If no ".." entry or it points to 0, go to root
+        temp_dir_cluster = 0;
       }
       
-      // TODO: We would need to navigate up the directory tree
-      // This would require keeping track of parent directories
-      // For simplicity, we'll reset to root for now
-      current_dir_cluster = 0;
+      // Update the path
+      char* last_slash = strrchr(temp_path, '/');
+      if (last_slash && last_slash != temp_path) {
+        *last_slash = '\0';
+      } else {
+        strcpy(temp_path, "/");
+      }
+      
       free(entries);
       token = strtok(NULL, "/");
       continue;
@@ -267,29 +358,44 @@ int changeDir(char* path) {
       continue;
     }
     
-    // Find the requested directory entry
-    entry = findEntry(entries, entry_count, token);
+    // Find the directory entry using our new function
+    entry = findEntryByName(entries, entry_count, token);
     
-    if (!entry || !(entry->attributes & 0x10)) {
+    if (!entry) {
       printf("Directory '%s' not found\n", token);
       free(entries);
       return -1;
     }
     
-    // Update current directory
-    current_dir_cluster = entry->starting_cluster;
-    
-    // Update path
-    if (strcmp(current_path, "/") != 0) {
-      strcat(current_path, "/");
+    // Check if it's a directory
+    if (!(entry->attributes & 0x10)) {
+      printf("'%s' is not a directory\n", token);
+      free(entries);
+      return -1;
     }
-    strcat(current_path, token);
+    
+    // Update current directory
+    temp_dir_cluster = entry->starting_cluster;
+    if (temp_dir_cluster == 0) {
+      // Special case: subdirectory pointing to cluster 0 means root
+      temp_dir_cluster = 0;
+      strcpy(temp_path, "/");
+    } else {
+      // Update path
+      if (strcmp(temp_path, "/") != 0) {
+        strcat(temp_path, "/");
+      }
+      strcat(temp_path, token);
+    }
     
     free(entries);
     token = strtok(NULL, "/");
   }
   
-  printf("Current directory: %s\n", current_path);
+  // Apply changes only if successful
+  current_dir_cluster = temp_dir_cluster;
+  strcpy(current_path, temp_path);
+  
   return 0;
 }
 
@@ -310,28 +416,27 @@ void printTreeRecursive(uint16_t cluster, int level, const char* prefix) {
         continue;
       }
       
-      // Format name
+      // Format name properly - ensure clean filename
+      memset(name_buf, 0, sizeof(name_buf));
       cleanFatName(name_buf, entries[i].filename, entries[i].ext);
       
-      // Print indentation
-      fprintf(stderr, "%s", prefix);
+      // Print indentation and proper tree structure
+      fprintf(stderr, "%s├── ", prefix);
       
       // Print filename with attributes
       if (entries[i].attributes & 0x10) {
         // It's a directory
-        fprintf(stderr, "[%s] (0x%02X)\n", name_buf, entries[i].attributes);
-        
-        // Prepare next level indentation
-        char new_prefix[256];
-        sprintf(new_prefix, "%s|   ", prefix);
+        fprintf(stderr, "[%s] (dir)\n", name_buf);
         
         // Recursive call for subdirectory
         if (entries[i].starting_cluster != 0) {
+          char new_prefix[256];
+          sprintf(new_prefix, "%s│   ", prefix);
           printTreeRecursive(entries[i].starting_cluster, level + 1, new_prefix);
         }
       } else {
         // It's a file
-        fprintf(stderr, "%s (0x%02X, %d bytes)\n", name_buf, entries[i].attributes, entries[i].file_size);
+        fprintf(stderr, "%s (%d bytes)\n", name_buf, entries[i].file_size);
       }
     }
   }
@@ -339,10 +444,17 @@ void printTreeRecursive(uint16_t cluster, int level, const char* prefix) {
   free(entries);
 }
 
+// Print the directory tree starting from current directory
 void printTree() {
   fprintf(stderr, "Directory Tree:\n");
-  fprintf(stderr, "/\n");
-  printTreeRecursive(0, 0, "|   ");
+  
+  if (current_dir_cluster == 0) {
+    fprintf(stderr, "[Root]\n");
+  } else {
+    fprintf(stderr, "[%s]\n", current_path);
+  }
+  
+  printTreeRecursive(current_dir_cluster, 0, "");
 }
 
 // File operations
@@ -356,6 +468,44 @@ void readFile(FILE* in, Fat16BootSector* bs, char* filename, PartitionTable* pt,
   uint32_t entry_count;
   Fat16Entry* dir_entries;
   FILE* output_file = NULL;
+  char* path_part;
+  char* file_part;
+  char path_copy[256];
+  uint16_t temp_dir_cluster = current_dir_cluster;
+  
+  // Check if we have a path with directory components
+  strcpy(path_copy, filename);
+  if (strchr(path_copy, '/')) {
+    char* token;
+    char dir_path[256] = "";
+    
+    // Extract the directory part and the filename part
+    file_part = strrchr(path_copy, '/');
+    *file_part = '\0'; // Split the path at the last slash
+    file_part++; // Move past the slash to get the filename
+    
+    // Now path_copy contains the directory path, and file_part points to the filename
+    
+    // Save current directory
+    uint16_t saved_cluster = current_dir_cluster;
+    char saved_path[256];
+    strcpy(saved_path, current_path);
+    
+    // Change to the directory containing the file
+    if (changeDir(path_copy) != 0) {
+      printf("Directory %s not found\n", path_copy);
+      return;
+    }
+    
+    // Read the file
+    readFile(in, bs, file_part, pt, save_to_file);
+    
+    // Restore the original directory
+    current_dir_cluster = saved_cluster;
+    strcpy(current_path, saved_path);
+    
+    return;
+  }
   
   // Read from current directory
   dir_entries = readDirectory(current_dir_cluster, &entry_count);
@@ -364,18 +514,25 @@ void readFile(FILE* in, Fat16BootSector* bs, char* filename, PartitionTable* pt,
     return;
   }
   
-  // Format name for FAT lookup
-  formatToFatName(filename, fname, ext);
-  
-  // Search for the file in current directory
-  for (i = 0; i < entry_count; i++) {
-    if (dir_entries[i].filename[0] != 0x00 && dir_entries[i].filename[0] != 0xE5 && 
-        !(dir_entries[i].attributes & 0x10)) {
-      if (memcmp(dir_entries[i].filename, fname, 8) == 0 && 
-          memcmp(dir_entries[i].ext, ext, 3) == 0) {
-        entry = dir_entries[i];
-        found = 1;
-        break;
+  // Try to find the file using our improved findEntryByName function first
+  Fat16Entry* found_entry = findEntryByName(dir_entries, entry_count, filename);
+  if (found_entry && !(found_entry->attributes & 0x10)) {
+    entry = *found_entry;
+    found = 1;
+  } else {
+    // Format name for FAT lookup as a fallback
+    formatToFatName(filename, fname, ext);
+    
+    // Traditional search for the file in current directory
+    for (i = 0; i < entry_count; i++) {
+      if (dir_entries[i].filename[0] != 0x00 && dir_entries[i].filename[0] != 0xE5 && 
+          !(dir_entries[i].attributes & 0x10)) {
+        if (memcmp(dir_entries[i].filename, fname, 8) == 0 && 
+            memcmp(dir_entries[i].ext, ext, 3) == 0) {
+          entry = dir_entries[i];
+          found = 1;
+          break;
+        }
       }
     }
   }
@@ -540,17 +697,15 @@ void executeCommand(char* cmd) {
 
 // Entry point
 int main() {
-  char cmd[256];
-  int running = 1;
-  
   if (initFileSystem("sd.img") != 0) {
     return 1;
   }
   
-  // Print directory tree to stderr
+  // 1. Print directory tree to stderr as requested in the assignment
+  fprintf(stderr, "Directory Tree (using printTree function):\n");
   printTree();
   
-  // List root directory contents
+  // 2. List root directory contents
   printf("\nFilesystem root directory listing\n-----------------------\n");
   printf(" Volume in drive: %.11s\n", fs.bs.volume_label);
   printf(" Directory of root:\n\n");
@@ -562,18 +717,54 @@ int main() {
     free(entries);
   }
   
-  // Interactive mode
+  // 3. Change to ADR1 directory
+  printf("\nChanging to ADR1 directory...\n");
+  if (changeDir("ADR1") == 0) {
+    printf("Successfully changed to directory: %s\n", current_path);
+    
+    // 4. List ADR1 contents
+    printf("\nDirectory listing of %s\n-----------------------\n", current_path);
+    entries = readDirectory(current_dir_cluster, &entry_count);
+    if (entries) {
+      printDirectoryEntries(entries, entry_count);
+      
+      // 5. Find the first file to display
+      int i;
+      char filename[13] = {0};
+      for (i = 0; i < entry_count; i++) {
+        if (entries[i].filename[0] != 0x00 && entries[i].filename[0] != 0xE5 && 
+            !(entries[i].attributes & 0x10) && !(entries[i].attributes & 0x08)) {
+          cleanFatName(filename, entries[i].filename, entries[i].ext);
+          break;
+        }
+      }
+      
+      free(entries);
+      
+      // 6. Display the file if found
+      if (filename[0] != 0) {
+        printf("\nDisplaying content of file '%s' from %s:\n", filename, current_path);
+        catFile(fs.fp, &fs.bs, filename, fs.pt);
+      }
+    }
+  } else {
+    printf("Failed to change to ADR1 directory\n");
+  }
+  
+  // Optional interactive mode
+  printf("\n\nEntering interactive mode. Type 'exit' to quit.\n");
+  char cmd[256];
+  int running = 1;
+  
   while (running) {
-    printf("\nCurrent directory: %s\n", current_path);
-    printf("Commands: cd, ls, cat, save, tree, exit\n");
-    printf("Enter command: ");
+    printf("\nFAT16:%s> ", current_path);
     
     fgets(cmd, sizeof(cmd), stdin);
     cmd[strcspn(cmd, "\n")] = '\0';  // Remove newline
     
     if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
       running = 0;
-    } else {
+    } else if (strlen(cmd) > 0) {
       executeCommand(cmd);
     }
   }
