@@ -7,7 +7,6 @@
 #include <stdint.h>
 
 // Global variables to track current directory
-Fat16Entry* current_dir = NULL;
 uint16_t current_dir_cluster = 0;
 char current_path[256] = "/";
 
@@ -22,6 +21,11 @@ typedef struct {
 
 FatFS fs;
 
+// Forward declarations
+Fat16Entry* readDirectory(uint16_t cluster, uint32_t* entryCount);
+uint16_t getFatEntry(uint16_t cluster);
+
+// Utility functions
 void formatDateTime(uint16_t date, uint16_t time, char* buffer) {
   int day = date & 0x1F;
   int month = (date >> 5) & 0x0F;
@@ -34,7 +38,61 @@ void formatDateTime(uint16_t date, uint16_t time, char* buffer) {
   sprintf(buffer, "%02d/%02d/%04d %02d:%02d:%02d", day, month, year, hours, minutes, seconds);
 }
 
-// Get the FAT entry for a specific cluster
+// Clean a FAT filename to make it human-readable
+void cleanFatName(char* dst, const unsigned char* filename, const unsigned char* ext) {
+  int i;
+  
+  // Copy filename (removing trailing spaces)
+  memcpy(dst, filename, 8);
+  dst[8] = '\0';
+  
+  for (i = 7; i >= 0; i--) {
+    if (dst[i] == ' ') {
+      dst[i] = '\0';
+    } else {
+      break;
+    }
+  }
+  
+  // Add extension if present
+  if (ext[0] != ' ') {
+    strcat(dst, ".");
+    for (i = 0; i < 3 && ext[i] != ' '; i++) {
+      dst[strlen(dst)] = ext[i];
+    }
+  }
+}
+
+// Format a name to FAT 8.3 format
+void formatToFatName(const char* input, char* fname, char* ext) {
+  int i;
+  const char* dot_pos = strchr(input, '.');
+  int name_len;
+  
+  // Fill with spaces initially
+  memset(fname, ' ', 8);
+  memset(ext, ' ', 3);
+  fname[8] = ext[3] = '\0';
+  
+  // Split filename and extension
+  if (dot_pos) {
+    name_len = dot_pos - input;
+    if (name_len > 8) name_len = 8;
+    strncpy(fname, input, name_len);
+    
+    strncpy(ext, dot_pos + 1, 3);
+  } else {
+    strncpy(fname, input, 8);
+  }
+  
+  // Convert to uppercase
+  for (i = 0; i < 8; i++) 
+    if (fname[i] != ' ') fname[i] = toupper(fname[i]);
+  for (i = 0; i < 3; i++) 
+    if (ext[i] != ' ') ext[i] = toupper(ext[i]);
+}
+
+// FAT file system functions
 uint16_t getFatEntry(uint16_t cluster) {
   uint16_t fat_entry = 0;
   uint32_t fat_offset = cluster * 2;
@@ -47,7 +105,6 @@ uint16_t getFatEntry(uint16_t cluster) {
   return fat_entry;
 }
 
-// Read the content of a directory given its starting cluster
 Fat16Entry* readDirectory(uint16_t cluster, uint32_t* entryCount) {
   Fat16Entry* entries = NULL;
   uint16_t current_cluster = cluster;
@@ -96,32 +153,12 @@ Fat16Entry* readDirectory(uint16_t cluster, uint32_t* entryCount) {
   return entries;
 }
 
-// Find an entry in a directory by name
 Fat16Entry* findEntry(Fat16Entry* dir_entries, uint32_t entry_count, const char* name) {
-  char fname[9] = {0};
-  char ext[4] = {0};
-  const char* dot_pos = strchr(name, '.');
-  int i, name_len;
+  char fname[9];
+  char ext[4];
+  int i;
   
-  // Split filename and extension
-  if (dot_pos) {
-    name_len = dot_pos - name;
-    if (name_len > 8) name_len = 8;
-    strncpy(fname, name, name_len);
-    
-    strncpy(ext, dot_pos + 1, 3);
-    ext[3] = '\0';
-  } else {
-    strncpy(fname, name, 8);
-  }
-  
-  // Pad with spaces
-  for (i = strlen(fname); i < 8; i++) fname[i] = ' ';
-  for (i = strlen(ext); i < 3; i++) ext[i] = ' ';
-  
-  // Convert to uppercase
-  for (i = 0; i < 8; i++) fname[i] = toupper(fname[i]);
-  for (i = 0; i < 3; i++) ext[i] = toupper(ext[i]);
+  formatToFatName(name, fname, ext);
   
   // Search for the file/directory in entries
   for (i = 0; i < entry_count; i++) {
@@ -136,7 +173,7 @@ Fat16Entry* findEntry(Fat16Entry* dir_entries, uint32_t entry_count, const char*
   return NULL;
 }
 
-// Print information about directory entries
+// User interface functions
 void printDirectoryEntries(Fat16Entry* entries, uint32_t entry_count) {
   int i;
   int fileCount = 0;
@@ -166,7 +203,6 @@ void printDirectoryEntries(Fat16Entry* entries, uint32_t entry_count) {
   printf("   %d File(s)    %d bytes\n", fileCount, totalSize);
 }
 
-// Change current directory
 int changeDir(char* path) {
   uint32_t entry_count;
   Fat16Entry* entries;
@@ -257,7 +293,6 @@ int changeDir(char* path) {
   return 0;
 }
 
-// Print the directory tree recursively
 void printTreeRecursive(uint16_t cluster, int level, const char* prefix) {
   uint32_t entry_count;
   Fat16Entry* entries = readDirectory(cluster, &entry_count);
@@ -276,32 +311,7 @@ void printTreeRecursive(uint16_t cluster, int level, const char* prefix) {
       }
       
       // Format name
-      memcpy(name_buf, entries[i].filename, 8);
-      name_buf[8] = '\0';
-      // Remove trailing spaces
-      for (int j = 7; j >= 0; j--) {
-        if (name_buf[j] == ' ') {
-          name_buf[j] = '\0';
-        } else {
-          break;
-        }
-      }
-      
-      // Add extension if present
-      if (entries[i].ext[0] != ' ') {
-        char ext_buf[5] = ".";
-        memcpy(ext_buf + 1, entries[i].ext, 3);
-        ext_buf[4] = '\0';
-        // Remove trailing spaces from extension
-        for (int j = 3; j >= 1; j--) {
-          if (ext_buf[j] == ' ') {
-            ext_buf[j] = '\0';
-          } else {
-            break;
-          }
-        }
-        strcat(name_buf, ext_buf);
-      }
+      cleanFatName(name_buf, entries[i].filename, entries[i].ext);
       
       // Print indentation
       fprintf(stderr, "%s", prefix);
@@ -329,22 +339,20 @@ void printTreeRecursive(uint16_t cluster, int level, const char* prefix) {
   free(entries);
 }
 
-// Wrapper to start directory tree printing
 void printTree() {
   fprintf(stderr, "Directory Tree:\n");
   fprintf(stderr, "/\n");
   printTreeRecursive(0, 0, "|   ");
 }
 
-void read(FILE* in, Fat16BootSector* bs, char* filename, PartitionTable* pt, int save_to_file) {
+// File operations
+void readFile(FILE* in, Fat16BootSector* bs, char* filename, PartitionTable* pt, int save_to_file) {
   Fat16Entry entry;
   char fname[9], ext[4];
   int i, found = 0;
   uint16_t cluster;
-  uint32_t fat_offset, fat_sector, entry_offset;
   uint16_t fat_entry, bytes_to_read;
   uint8_t* buffer;
-  uint32_t dir_offset;
   uint32_t entry_count;
   Fat16Entry* dir_entries;
   FILE* output_file = NULL;
@@ -356,30 +364,15 @@ void read(FILE* in, Fat16BootSector* bs, char* filename, PartitionTable* pt, int
     return;
   }
   
-  // Extract filename and extension (and convert to uppercase)
-  for (i = 0; i < 8 && filename[i] != '.' && filename[i] != '\0'; i++) {
-    fname[i] = toupper(filename[i]);
-  }
-  while (i < 8) fname[i++] = ' ';  // Pad with spaces
-  fname[8] = '\0';
-  
-  if (strchr(filename, '.')) {
-    char* extension = strchr(filename, '.') + 1;
-    for (i = 0; i < 3 && extension[i] != '\0'; i++) {
-      ext[i] = toupper(extension[i]);
-    }
-    while (i < 3) ext[i++] = ' ';  // Pad with spaces
-  } else {
-    for (i = 0; i < 3; i++) ext[i] = ' ';
-  }
-  ext[3] = '\0';
+  // Format name for FAT lookup
+  formatToFatName(filename, fname, ext);
   
   // Search for the file in current directory
   for (i = 0; i < entry_count; i++) {
     if (dir_entries[i].filename[0] != 0x00 && dir_entries[i].filename[0] != 0xE5 && 
         !(dir_entries[i].attributes & 0x10)) {
-      if (strncmp((char*)dir_entries[i].filename, fname, 8) == 0 && 
-          strncmp((char*)dir_entries[i].ext, ext, 3) == 0) {
+      if (memcmp(dir_entries[i].filename, fname, 8) == 0 && 
+          memcmp(dir_entries[i].ext, ext, 3) == 0) {
         entry = dir_entries[i];
         found = 1;
         break;
@@ -406,26 +399,8 @@ void read(FILE* in, Fat16BootSector* bs, char* filename, PartitionTable* pt, int
     char output_filename[256];
     char clean_name[13];
     
-    // Create a clean filename (without FAT padding spaces)
-    memcpy(clean_name, entry.filename, 8);
-    clean_name[8] = '\0';
-    
-    // Remove trailing spaces
-    for (i = 7; i >= 0; i--) {
-      if (clean_name[i] == ' ') {
-        clean_name[i] = '\0';
-      } else {
-        break;
-      }
-    }
-    
-    // Add extension if present
-    if (entry.ext[0] != ' ') {
-      strcat(clean_name, ".");
-      for (i = 0; i < 3 && entry.ext[i] != ' '; i++) {
-        clean_name[strlen(clean_name)] = entry.ext[i];
-      }
-    }
+    // Create a clean filename
+    cleanFatName(clean_name, entry.filename, entry.ext);
     
     // Use the original user-provided filename instead of the FAT name
     // This preserves the case and format of the filename
@@ -474,14 +449,7 @@ void read(FILE* in, Fat16BootSector* bs, char* filename, PartitionTable* pt, int
     remaining_size -= bytes_to_read;
     
     // Get next cluster from FAT
-    fat_sector = bs->reserved_sectors + (cluster * 2) / bs->sector_size;
-    entry_offset = (cluster * 2) % bs->sector_size;
-    
-    fseek(in, (fat_sector * bs->sector_size) + pt[0].start_sector * 512 + entry_offset, SEEK_SET);
-    fread(&fat_entry, 2, 1, in);
-    
-    // Update cluster for next iteration
-    cluster = fat_entry;
+    cluster = getFatEntry(cluster);
   }
   
   free(buffer);
@@ -492,25 +460,24 @@ void read(FILE* in, Fat16BootSector* bs, char* filename, PartitionTable* pt, int
   }
 }
 
-// Alias for read function with a more intuitive name
-void cat(FILE* in, Fat16BootSector* bs, char* filename, PartitionTable* pt) {
-  read(in, bs, filename, pt, 0); // 0 means don't save to file, just display
+// Wrapper functions
+void catFile(FILE* in, Fat16BootSector* bs, char* filename, PartitionTable* pt) {
+  readFile(in, bs, filename, pt, 0); // 0 means don't save to file, just display
 }
 
-// Function to save file content to disk
-void save(FILE* in, Fat16BootSector* bs, char* filename, PartitionTable* pt) {
-  read(in, bs, filename, pt, 1); // 1 means save to file
+void saveFile(FILE* in, Fat16BootSector* bs, char* filename, PartitionTable* pt) {
+  readFile(in, bs, filename, pt, 1); // 1 means save to file
 }
 
-int main() {
+// Initialization function
+int initFileSystem(const char* image_path) {
   int i;
-  char choice[32];
   
-  fs.fp = fopen("sd.img", "rb");
+  fs.fp = fopen(image_path, "rb");
   
   if (!fs.fp) {
-    printf("Error opening sd.img file\n");
-    return 1;
+    printf("Error opening %s file\n", image_path);
+    return -1;
   }
 
   fseek(fs.fp, 0x1BE, SEEK_SET);                // go to partition table start
@@ -537,6 +504,49 @@ int main() {
   current_dir_cluster = 0;
   strcpy(current_path, "/");
   
+  return 0;
+}
+
+// CLI command parser and executor
+void executeCommand(char* cmd) {
+  if (strncmp(cmd, "cd ", 3) == 0) {
+    changeDir(cmd + 3);
+  } 
+  else if (strcmp(cmd, "ls") == 0) {
+    uint32_t entry_count;
+    Fat16Entry* entries = readDirectory(current_dir_cluster, &entry_count);
+    if (entries) {
+      printDirectoryEntries(entries, entry_count);
+      free(entries);
+    }
+  }
+  else if (strncmp(cmd, "cat ", 4) == 0) {
+    catFile(fs.fp, &fs.bs, cmd + 4, fs.pt);
+  }
+  else if (strncmp(cmd, "save ", 5) == 0) {
+    saveFile(fs.fp, &fs.bs, cmd + 5, fs.pt);
+  }
+  else if (strcmp(cmd, "tree") == 0) {
+    printTree();
+  }
+  else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
+    // Handled in the main loop
+  }
+  else {
+    printf("Unknown command: %s\n", cmd);
+    printf("Available commands: cd, ls, cat, save, tree, exit\n");
+  }
+}
+
+// Entry point
+int main() {
+  char cmd[256];
+  int running = 1;
+  
+  if (initFileSystem("sd.img") != 0) {
+    return 1;
+  }
+  
   // Print directory tree to stderr
   printTree();
   
@@ -553,46 +563,18 @@ int main() {
   }
   
   // Interactive mode
-  int running = 1;
   while (running) {
     printf("\nCurrent directory: %s\n", current_path);
-    printf("Commands: \n");
-    printf("1. cd <path> - Change directory\n");
-    printf("2. ls - List directory contents\n");
-    printf("3. cat <filename> - Display file contents\n");
-    printf("4. save <filename> - Save file contents to disk\n");
-    printf("5. tree - Display directory tree\n");
-    printf("6. exit - Exit program\n");
+    printf("Commands: cd, ls, cat, save, tree, exit\n");
     printf("Enter command: ");
     
-    char cmd[256];
     fgets(cmd, sizeof(cmd), stdin);
     cmd[strcspn(cmd, "\n")] = '\0';  // Remove newline
     
-    if (strncmp(cmd, "cd ", 3) == 0) {
-      changeDir(cmd + 3);
-    } 
-    else if (strcmp(cmd, "ls") == 0) {
-      entries = readDirectory(current_dir_cluster, &entry_count);
-      if (entries) {
-        printDirectoryEntries(entries, entry_count);
-        free(entries);
-      }
-    }
-    else if (strncmp(cmd, "cat ", 4) == 0) {
-      cat(fs.fp, &fs.bs, cmd + 4, fs.pt);
-    }
-    else if (strncmp(cmd, "save ", 5) == 0) {
-      save(fs.fp, &fs.bs, cmd + 5, fs.pt);
-    }
-    else if (strcmp(cmd, "tree") == 0) {
-      printTree();
-    }
-    else if (strcmp(cmd, "exit") == 0) {
+    if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
       running = 0;
-    }
-    else {
-      printf("Unknown command\n");
+    } else {
+      executeCommand(cmd);
     }
   }
 
