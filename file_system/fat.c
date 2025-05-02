@@ -40,40 +40,21 @@ void formatDateTime(uint16_t date, uint16_t time, char* buffer) {
 
 // Clean a FAT filename to make it human-readable
 void cleanFatName(char* dst, const unsigned char* filename, const unsigned char* ext) {
-  int i;
-  
+  int i, j = 0;
   // Copy filename (removing trailing spaces)
-  memcpy(dst, filename, 8);
-  dst[8] = '\0';
-  
-  for (i = 7; i >= 0; i--) {
-    if (dst[i] == ' ') {
-      dst[i] = '\0';
-    } else {
-      break;
-    }
+  for (i = 0; i < 8 && filename[i] != ' '; i++) {
+    if (filename[i] == 0x00) break;
+    dst[j++] = filename[i];
   }
-  
   // Add extension if present and not all spaces
   if (ext[0] != ' ' || ext[1] != ' ' || ext[2] != ' ') {
-    strcat(dst, ".");
-    
-    // Copy extension without trailing spaces
-    char ext_copy[4] = {0};
-    memcpy(ext_copy, ext, 3);
-    
-    // Remove control characters if any
-    for (i = 0; i < 3; i++) {
-      if (ext_copy[i] < 32 || ext_copy[i] > 126) {
-        ext_copy[i] = '_';  // Replace non-printable chars
-      }
-    }
-    
-    // Append clean extension
-    for (i = 0; i < 3 && ext_copy[i] != ' '; i++) {
-      dst[strlen(dst)] = ext_copy[i];
+    dst[j++] = '.';
+    for (i = 0; i < 3 && ext[i] != ' '; i++) {
+      if (ext[i] == 0x00) break;
+      dst[j++] = ext[i];
     }
   }
+  dst[j] = '\0';
 }
 
 // Format a name to FAT 8.3 format
@@ -260,34 +241,27 @@ void printDirectoryEntries(Fat16Entry* entries, uint32_t entry_count) {
   int i;
   int fileCount = 0;
   uint32_t totalSize = 0;
-  
-  printf(" Name        Ext  Attr       Size  Date       Time     Cluster\n");
-  printf("----------  ---  ------  -------  ---------  -------  -------\n");
-  
+  printf(" %-20s  Attr       Size  Date       Time     Cluster\n", "Name");
+  printf("--------------------  ------  -------  ---------  -------  -------\n");
   for (i = 0; i < entry_count; i++) {
     if (entries[i].filename[0] != 0x00 && entries[i].filename[0] != 0xE5) {
       char dateTimeStr[20];
       char attrStr[7];
-      
+      char name_buf[20];
+      cleanFatName(name_buf, entries[i].filename, entries[i].ext);
       formatDateTime(entries[i].modify_date, entries[i].modify_time, dateTimeStr);
       formatAttributes(entries[i].attributes, attrStr);
-      
-      printf(" %-8.8s  %-3.3s  %s  %7d  %s  %5d\n", 
-             entries[i].filename, entries[i].ext, attrStr, entries[i].file_size, 
+      printf(" %-20s  %s  %7d  %s  %5d\n",
+             name_buf, attrStr, entries[i].file_size,
              dateTimeStr, entries[i].starting_cluster);
-      
-      // Not a directory and not volume ID
-      if (!(entries[i].attributes & 0x10) && !(entries[i].attributes & 0x08)) { 
+      if (!(entries[i].attributes & 0x10) && !(entries[i].attributes & 0x08)) {
         fileCount++;
         totalSize += entries[i].file_size;
       }
     }
   }
-  
-  printf("----------  ---  ------  -------  ---------  -------  -------\n");
+  printf("--------------------  ------  -------  ---------  -------  -------\n");
   printf("   %d File(s)    %d bytes\n", fileCount, totalSize);
-  
-  // Legend for attributes
   printf("\nAttribute legend: R-Read-only, H-Hidden, S-System, V-Volume, D-Directory, A-Archive\n");
 }
 
@@ -911,7 +885,7 @@ void printHelp() {
     printf("  tree                    Print directory tree\n");
     printf("  write <file>            Write file from stdin to FAT16\n");
     printf("  write -f <src> <file>   Write file from Linux file <src> to FAT16\n");
-    printf("  rm <file>                Delete file from FAT16\n");
+    printf("  rm <file>               Delete file from FAT16\n");
     printf("  help                    Show this help message\n");
     printf("  exit, quit              Exit the shell\n");
 }
