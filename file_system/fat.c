@@ -816,6 +816,54 @@ void write(char *args) {
     }
 }
 
+// Delete a file from the FAT16 filesystem
+void rm(char *filename) {
+    uint32_t entry_count;
+    Fat16Entry* entries = readDirectory(current_dir_cluster, &entry_count);
+    if (!entries) {
+      printf("Error reading directory\n");
+      return;
+    }
+    // Find file by name (case-insensitive, respecting FAT 8.3 naming convention)
+    Fat16Entry* entry = findEntryByName(entries, entry_count, filename);
+    if (!entry || (entry->attributes & 0x10)) {
+      printf("File '%s' not found or is a directory.\n", filename);
+      free(entries);
+      return;
+    }
+    // Save the directory entry offset
+    size_t entry_idx = entry - entries;
+    // Free all clusters in the FAT
+    uint16_t cluster = entry->starting_cluster;
+    while (cluster >= 0x0002 && cluster < 0xFFF8) {
+      uint16_t next = getFatEntry(cluster);
+      // Write to all copies of the FAT table
+      for (int f = 0; f < fs.bs.number_of_fats; f++) {
+        uint32_t fat_offset = cluster * 2;
+        uint32_t fat_sector = fs.bs.reserved_sectors + (fat_offset / fs.bs.sector_size);
+        uint32_t entry_offset = fat_offset % fs.bs.sector_size;
+        fseek(fs.fp, (fat_sector * fs.bs.sector_size) + fs.pt[0].start_sector * 512 + entry_offset + f * fs.bs.fat_size_sectors * fs.bs.sector_size, SEEK_SET);
+        uint16_t zero = 0x0000;
+        fwrite(&zero, 2, 1, fs.fp);
+        fflush(fs.fp);
+      }
+      cluster = next;
+    }
+    // Mark the file as deleted by changing the first character to 0xE5
+    uint32_t dir_offset;
+    if (current_dir_cluster == 0) {
+        dir_offset = fs.root_dir_offset + entry_idx * sizeof(Fat16Entry);
+    } else {
+        dir_offset = fs.data_area_offset + (current_dir_cluster - 2) * fs.bs.sectors_per_cluster * fs.bs.sector_size + entry_idx * sizeof(Fat16Entry);
+    }
+    fseek(fs.fp, dir_offset, SEEK_SET);
+    unsigned char e5 = 0xE5;
+    fwrite(&e5, 1, 1, fs.fp);
+    fflush(fs.fp);
+    printf("Soubor '%s' byl smazán.\n", filename);
+    free(entries);
+}
+
 // Initialization function
 int initFileSystem(const char* image_path) {
   int i;
@@ -863,6 +911,7 @@ void printHelp() {
     printf("  tree                    Print directory tree\n");
     printf("  write <file>            Write file from stdin to FAT16\n");
     printf("  write -f <src> <file>   Write file from Linux file <src> to FAT16\n");
+    printf("  rm <file>                Delete file from FAT16\n");
     printf("  help                    Show this help message\n");
     printf("  exit, quit              Exit the shell\n");
 }
@@ -927,6 +976,9 @@ void executeCommand(char* cmd) {
   }
   else if (strncmp(cmd, "write ", 6) == 0) {
     write(cmd + 6); // now takes the whole arg string
+  }
+  else if (strncmp(cmd, "rm ", 3) == 0) {
+    rm(cmd + 3);
   }
   else if (strcmp(cmd, "help") == 0) {
     printHelp();
