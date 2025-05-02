@@ -686,9 +686,42 @@ void executeCommand(char* cmd) {
   if (strncmp(cmd, "cd ", 3) == 0) {
     changeDir(cmd + 3);
   } 
+  else if (strncmp(cmd, "ls ", 3) == 0) {
+    // Handle ls with directory path
+    char* dir_path = cmd + 3;
+    
+    // Save current directory
+    uint16_t saved_cluster = current_dir_cluster;
+    char saved_path[256];
+    strcpy(saved_path, current_path);
+    
+    // Try to change to the specified directory
+    if (changeDir(dir_path) == 0) {
+      // If successful, list its contents
+      uint32_t entry_count;
+      Fat16Entry* entries = readDirectory(current_dir_cluster, &entry_count);
+      
+      printf("Directory of %s:\n\n", current_path);
+      
+      if (entries) {
+        printDirectoryEntries(entries, entry_count);
+        free(entries);
+      }
+      
+      // Restore original directory
+      current_dir_cluster = saved_cluster;
+      strcpy(current_path, saved_path);
+    } else {
+      printf("Directory %s not found\n", dir_path);
+    }
+  }
   else if (strcmp(cmd, "ls") == 0) {
+    // List current directory
     uint32_t entry_count;
     Fat16Entry* entries = readDirectory(current_dir_cluster, &entry_count);
+    
+    printf("Directory of %s:\n\n", current_path);
+    
     if (entries) {
       printDirectoryEntries(entries, entry_count);
       free(entries);
