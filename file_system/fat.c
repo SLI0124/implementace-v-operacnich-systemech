@@ -188,16 +188,9 @@ Fat16Entry* findEntry(Fat16Entry* dir_entries, uint32_t entry_count, const char*
   
   formatToFatName(name, fname, ext);
   
-  // Debug printout - show what we're looking for
-  printf("Looking for directory/file: '%s' as '%.8s'.'%.3s'\n", name, fname, ext);
-  
   // Search for the file/directory in entries
   for (i = 0; i < entry_count; i++) {
     if (dir_entries[i].filename[0] != 0x00 && dir_entries[i].filename[0] != 0xE5) {
-      // Debug printout - show what entries we have
-      printf("Entry %d: '%.8s'.'%.3s' (attr: 0x%02X)\n", i, 
-             dir_entries[i].filename, dir_entries[i].ext, dir_entries[i].attributes);
-      
       // For directories, compare only the filename part (ignore extension)
       if ((dir_entries[i].attributes & 0x10) && 
           strncmp(dir_entries[i].filename, fname, 8) == 0) {
@@ -591,7 +584,6 @@ void readFile(FILE* in, Fat16BootSector* bs, char* filename, PartitionTable* pt,
       free(buffer);
       return;
     }
-    fprintf(stderr, "Saving file to: %s\n", output_filename);
   }
   
   // File found, read its contents cluster by cluster
@@ -600,8 +592,6 @@ void readFile(FILE* in, Fat16BootSector* bs, char* filename, PartitionTable* pt,
   uint32_t data_start = (bs->reserved_sectors + bs->number_of_fats * bs->fat_size_sectors + 
       (bs->root_dir_entries * 32 + bs->sector_size - 1) / bs->sector_size) * bs->sector_size + 
       pt[0].start_sector * 512;
-  
-  fprintf(stderr, "\nReading file: %s, size: %d bytes\n", filename, entry.file_size);
   
   // Read all clusters
   while (cluster >= 0x0002 && cluster < 0xFFF8 && remaining_size > 0) {
@@ -630,7 +620,6 @@ void readFile(FILE* in, Fat16BootSector* bs, char* filename, PartitionTable* pt,
   
   if (save_to_file && output_file) {
     fclose(output_file);
-    fprintf(stderr, "File saved successfully\n");
   }
 }
 
@@ -643,11 +632,177 @@ void saveFile(FILE* in, Fat16BootSector* bs, char* filename, PartitionTable* pt)
   readFile(in, bs, filename, pt, 1); // 1 means save to file
 }
 
+// Write file from stdin to disk image
+void write(char *filename) {
+    // Handle path with directories
+    char path_copy[256];
+    strcpy(path_copy, filename);
+    char *last_slash = strrchr(path_copy, '/');
+    char *file_part = filename;
+    uint16_t saved_cluster = current_dir_cluster;
+    char saved_path[256];
+    strcpy(saved_path, current_path);
+    if (last_slash) {
+        *last_slash = '\0';
+        file_part = last_slash + 1;
+        if (changeDir(path_copy) != 0) {
+            printf("Directory %s not found\n", path_copy);
+            return;
+        }
+    }
+    // Step 1: Find free directory entry
+    uint32_t entry_count;
+    Fat16Entry* entries = readDirectory(current_dir_cluster, &entry_count);
+    int free_entry_idx = -1;
+    for (uint32_t i = 0; i < entry_count; i++) {
+        if (entries[i].filename[0] == 0x00 || entries[i].filename[0] == 0xE5) {
+            free_entry_idx = i;
+            break;
+        }
+    }
+    if (free_entry_idx == -1) {
+        printf("No free directory entry found (directory full).\n");
+        free(entries);
+        // Restore previous directory if changed
+        if (last_slash) {
+            current_dir_cluster = saved_cluster;
+            strcpy(current_path, saved_path);
+        }
+        return;
+    }
+
+    // Step 2: Find first free cluster in FAT
+    uint16_t total_clusters = (fs.bs.total_sectors_short ? fs.bs.total_sectors_short : fs.bs.total_sectors_int)
+        / fs.bs.sectors_per_cluster;
+    uint16_t first_free_cluster = 0;
+    for (uint16_t c = 2; c < total_clusters; c++) {
+        if (getFatEntry(c) == 0x0000) {
+            first_free_cluster = c;
+            break;
+        }
+    }
+    if (first_free_cluster == 0) {
+        printf("No free cluster found.\n");
+        free(entries);
+        // Restore previous directory if changed
+        if (last_slash) {
+            current_dir_cluster = saved_cluster;
+            strcpy(current_path, saved_path);
+        }
+        return;
+    }
+
+    // Step 3: Prepare directory entry
+    Fat16Entry new_entry = {0};
+    char fname[9], ext[4];
+    formatToFatName(file_part, fname, ext);
+    memcpy(new_entry.filename, fname, 8);
+    memcpy(new_entry.ext, ext, 3);
+    new_entry.attributes = 0x20; // Archive
+    new_entry.starting_cluster = first_free_cluster;
+    new_entry.file_size = 0; // Will update later
+    time_t now = time(NULL);
+    struct tm *tm_now = localtime(&now);
+    new_entry.modify_date = ((tm_now->tm_year - 80) << 9) | ((tm_now->tm_mon + 1) << 5) | tm_now->tm_mday;
+    new_entry.modify_time = (tm_now->tm_hour << 11) | (tm_now->tm_min << 5) | (tm_now->tm_sec / 2);
+
+    // Step 4: Write data from stdin to clusters
+    uint16_t current_cluster = first_free_cluster;
+    uint16_t prev_cluster = 0;
+    uint32_t bytes_written = 0;
+    uint32_t cluster_size = fs.bs.sectors_per_cluster * fs.bs.sector_size;
+    uint8_t *buffer = malloc(cluster_size);
+    if (!buffer) {
+        printf("Memory allocation error\n");
+        free(entries);
+        // Restore previous directory if changed
+        if (last_slash) {
+            current_dir_cluster = saved_cluster;
+            strcpy(current_path, saved_path);
+        }
+        return;
+    }
+    int last = 0;
+    while (!last) {
+        size_t n = fread(buffer, 1, cluster_size, stdin);
+        if (n == 0) {
+            if (feof(stdin)) {
+                clearerr(stdin); // Reset EOF for next shell command
+                break;
+            } else {
+                printf("Read error from stdin.\n");
+                break;
+            }
+        }
+        if (n < cluster_size) last = 1;
+        // Write to cluster
+        uint32_t cluster_offset = fs.data_area_offset + (current_cluster - 2) * cluster_size;
+        fseek(fs.fp, cluster_offset, SEEK_SET);
+        fwrite(buffer, 1, n, fs.fp);
+        fflush(fs.fp);
+        // Update FAT
+        uint16_t next_cluster = 0;
+        if (!last) {
+            // Find next free cluster
+            for (uint16_t c = current_cluster + 1; c < total_clusters; c++) {
+                if (getFatEntry(c) == 0x0000) {
+                    next_cluster = c;
+                    break;
+                }
+            }
+            if (next_cluster == 0) {
+                printf("Disk full while writing.\n");
+                break;
+            }
+        } else {
+            next_cluster = 0xFFFF; // EOC
+        }
+        // Write FAT entry for current cluster
+        uint32_t fat_offset = current_cluster * 2;
+        uint32_t fat_sector = fs.bs.reserved_sectors + (fat_offset / fs.bs.sector_size);
+        uint32_t entry_offset = fat_offset % fs.bs.sector_size;
+        for (int f = 0; f < fs.bs.number_of_fats; f++) {
+            fseek(fs.fp, (fat_sector * fs.bs.sector_size) + fs.pt[0].start_sector * 512 + entry_offset + f * fs.bs.fat_size_sectors * fs.bs.sector_size, SEEK_SET);
+            uint16_t val = next_cluster;
+            fwrite(&val, 2, 1, fs.fp);
+            fflush(fs.fp);
+        }
+        if (prev_cluster && prev_cluster != current_cluster) {
+            // Update previous cluster's FAT entry to point to current
+            // Already done in previous loop
+        }
+        prev_cluster = current_cluster;
+        current_cluster = next_cluster;
+        bytes_written += n;
+    }
+    free(buffer);
+
+    // Step 5: Update directory entry with file size
+    new_entry.file_size = bytes_written;
+    // Write directory entry back
+    uint32_t dir_offset;
+    if (current_dir_cluster == 0) {
+        dir_offset = fs.root_dir_offset + free_entry_idx * sizeof(Fat16Entry);
+    } else {
+        dir_offset = fs.data_area_offset + (current_dir_cluster - 2) * fs.bs.sectors_per_cluster * fs.bs.sector_size + free_entry_idx * sizeof(Fat16Entry);
+    }
+    fseek(fs.fp, dir_offset, SEEK_SET);
+    fwrite(&new_entry, sizeof(Fat16Entry), 1, fs.fp);
+    fflush(fs.fp);
+    free(entries);
+    printf("File '%s' written (%u bytes).\n", filename, bytes_written);
+    // Restore previous directory if changed
+    if (last_slash) {
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+    }
+}
+
 // Initialization function
 int initFileSystem(const char* image_path) {
   int i;
   
-  fs.fp = fopen(image_path, "rb");
+  fs.fp = fopen(image_path, "rb+");
   
   if (!fs.fp) {
     printf("Error opening %s file\n", image_path);
@@ -739,9 +894,12 @@ void executeCommand(char* cmd) {
   else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
     // Handled in the main loop
   }
+  else if (strncmp(cmd, "write ", 6) == 0) {
+    write(cmd + 6);
+  }
   else {
     printf("Unknown command: %s\n", cmd);
-    printf("Available commands: cd, ls, cat, save, tree, exit\n");
+    printf("Available commands: cd, ls, cat, save, tree, write, exit\n");
   }
 }
 
@@ -752,17 +910,22 @@ int main() {
   }
   
   printf("\nEntering interactive mode. Type 'exit' to quit.\n");
-  printf("Available commands: cd, ls, cat, save, tree, exit\n");
+  printf("Available commands: cd, ls, cat, save, tree, write, exit\n");
   
   char cmd[256];
   int running = 1;
   
   while (running) {
     printf("\nFAT16:%s> ", current_path);
-    
-    fgets(cmd, sizeof(cmd), stdin);
+    if (fgets(cmd, sizeof(cmd), stdin) == NULL) {
+      if (feof(stdin)) {
+        clearerr(stdin); // Reset EOF for next command
+        printf("\n");
+        continue;
+      }
+      break;
+    }
     cmd[strcspn(cmd, "\n")] = '\0';  // Remove newline
-    
     if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
       running = 0;
     } else if (strlen(cmd) > 0) {
