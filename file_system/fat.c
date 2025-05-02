@@ -251,6 +251,17 @@ Fat16Entry* findEntryByName(Fat16Entry* entries, uint32_t entry_count, const cha
   return NULL;
 }
 
+// Helper function to format file attributes into a human-readable string
+void formatAttributes(uint8_t attributes, char* buffer) {
+    buffer[0] = (attributes & 0x01) ? 'R' : '-'; // Read-only
+    buffer[1] = (attributes & 0x02) ? 'H' : '-'; // Hidden
+    buffer[2] = (attributes & 0x04) ? 'S' : '-'; // System
+    buffer[3] = (attributes & 0x08) ? 'V' : '-'; // Volume label
+    buffer[4] = (attributes & 0x10) ? 'D' : '-'; // Directory
+    buffer[5] = (attributes & 0x20) ? 'A' : '-'; // Archive
+    buffer[6] = '\0';
+}
+
 // User interface functions
 void printDirectoryEntries(Fat16Entry* entries, uint32_t entry_count) {
   int i;
@@ -263,10 +274,13 @@ void printDirectoryEntries(Fat16Entry* entries, uint32_t entry_count) {
   for (i = 0; i < entry_count; i++) {
     if (entries[i].filename[0] != 0x00 && entries[i].filename[0] != 0xE5) {
       char dateTimeStr[20];
-      formatDateTime(entries[i].modify_date, entries[i].modify_time, dateTimeStr);
+      char attrStr[7];
       
-      printf(" %-8.8s  %-3.3s  0x%02X  %7d  %s  %5d\n", 
-             entries[i].filename, entries[i].ext, entries[i].attributes, entries[i].file_size, 
+      formatDateTime(entries[i].modify_date, entries[i].modify_time, dateTimeStr);
+      formatAttributes(entries[i].attributes, attrStr);
+      
+      printf(" %-8.8s  %-3.3s  %s  %7d  %s  %5d\n", 
+             entries[i].filename, entries[i].ext, attrStr, entries[i].file_size, 
              dateTimeStr, entries[i].starting_cluster);
       
       // Not a directory and not volume ID
@@ -279,6 +293,9 @@ void printDirectoryEntries(Fat16Entry* entries, uint32_t entry_count) {
   
   printf("----------  ---  ------  -------  ---------  -------  -------\n");
   printf("   %d File(s)    %d bytes\n", fileCount, totalSize);
+  
+  // Legend for attributes
+  printf("\nAttribute legend: R-Read-only, H-Hidden, S-System, V-Volume, D-Directory, A-Archive\n");
 }
 
 // Revised changeDir implementation
