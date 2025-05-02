@@ -563,19 +563,17 @@ void readFile(FILE* in, Fat16BootSector* bs, char* filename, PartitionTable* pt,
   
   // If saving to file, create the output file
   if (save_to_file) {
-    char output_filename[256];
-    char clean_name[13];
+    char output_filename[512]; 
+    char clean_name[256];
     
     // Create a clean filename
     cleanFatName(clean_name, entry.filename, entry.ext);
     
-    // Use the original user-provided filename instead of the FAT name
-    // This preserves the case and format of the filename
+    // Use the original user-provided filename if possible
     if (strchr(filename, '.')) {
-      sprintf(output_filename, "%s", filename);
+      snprintf(output_filename, sizeof(output_filename), "%s", filename);
     } else {
-      // If no extension in user input, use the clean name from FAT
-      sprintf(output_filename, "%s", clean_name);
+      snprintf(output_filename, sizeof(output_filename), "%s", clean_name);
     }
     
     output_file = fopen(output_filename, "wb");
@@ -633,12 +631,39 @@ void saveFile(FILE* in, Fat16BootSector* bs, char* filename, PartitionTable* pt)
 }
 
 // Write file from stdin to disk image
-void write(char *filename) {
-    // Handle path with directories
+void write(char *args) {
+    // Support: write [-f linuxfile] fatfile
+    char *src_file = NULL;
+    char *fatfile = NULL;
+    char *token;
+    char argbuf[256];
+    strncpy(argbuf, args, 255);
+    argbuf[255] = '\0';
+    token = strtok(argbuf, " ");
+    if (token && strcmp(token, "-f") == 0) {
+        src_file = strtok(NULL, " ");
+        fatfile = strtok(NULL, ""); // rest is the FAT16 path
+        if (!src_file || !fatfile) {
+            printf("Usage: write [-f linuxfile] fatfile\n");
+            return;
+        }
+    } else {
+        fatfile = args;
+        while (*fatfile == ' ') fatfile++;
+    }
+    FILE *input = stdin;
+    if (src_file) {
+        input = fopen(src_file, "rb");
+        if (!input) {
+            printf("Cannot open source file: %s\n", src_file);
+            return;
+        }
+    }
+    // ...existing code of write, but use 'input' instead of stdin for fread...
     char path_copy[256];
-    strcpy(path_copy, filename);
+    strcpy(path_copy, fatfile);
     char *last_slash = strrchr(path_copy, '/');
-    char *file_part = filename;
+    char *file_part = fatfile;
     uint16_t saved_cluster = current_dir_cluster;
     char saved_path[256];
     strcpy(saved_path, current_path);
@@ -647,6 +672,7 @@ void write(char *filename) {
         file_part = last_slash + 1;
         if (changeDir(path_copy) != 0) {
             printf("Directory %s not found\n", path_copy);
+            if (src_file) fclose(input);
             return;
         }
     }
@@ -663,14 +689,13 @@ void write(char *filename) {
     if (free_entry_idx == -1) {
         printf("No free directory entry found (directory full).\n");
         free(entries);
-        // Restore previous directory if changed
+        if (src_file) fclose(input);
         if (last_slash) {
             current_dir_cluster = saved_cluster;
             strcpy(current_path, saved_path);
         }
         return;
     }
-
     // Step 2: Find first free cluster in FAT
     uint16_t total_clusters = (fs.bs.total_sectors_short ? fs.bs.total_sectors_short : fs.bs.total_sectors_int)
         / fs.bs.sectors_per_cluster;
@@ -684,14 +709,13 @@ void write(char *filename) {
     if (first_free_cluster == 0) {
         printf("No free cluster found.\n");
         free(entries);
-        // Restore previous directory if changed
+        if (src_file) fclose(input);
         if (last_slash) {
             current_dir_cluster = saved_cluster;
             strcpy(current_path, saved_path);
         }
         return;
     }
-
     // Step 3: Prepare directory entry
     Fat16Entry new_entry = {0};
     char fname[9], ext[4];
@@ -705,8 +729,7 @@ void write(char *filename) {
     struct tm *tm_now = localtime(&now);
     new_entry.modify_date = ((tm_now->tm_year - 80) << 9) | ((tm_now->tm_mon + 1) << 5) | tm_now->tm_mday;
     new_entry.modify_time = (tm_now->tm_hour << 11) | (tm_now->tm_min << 5) | (tm_now->tm_sec / 2);
-
-    // Step 4: Write data from stdin to clusters
+    // Step 4: Write data from input to clusters
     uint16_t current_cluster = first_free_cluster;
     uint16_t prev_cluster = 0;
     uint32_t bytes_written = 0;
@@ -715,7 +738,7 @@ void write(char *filename) {
     if (!buffer) {
         printf("Memory allocation error\n");
         free(entries);
-        // Restore previous directory if changed
+        if (src_file) fclose(input);
         if (last_slash) {
             current_dir_cluster = saved_cluster;
             strcpy(current_path, saved_path);
@@ -724,13 +747,15 @@ void write(char *filename) {
     }
     int last = 0;
     while (!last) {
-        size_t n = fread(buffer, 1, cluster_size, stdin);
+        size_t n = fread(buffer, 1, cluster_size, input);
         if (n == 0) {
-            if (feof(stdin)) {
-                clearerr(stdin); // Reset EOF for next shell command
+            if (input == stdin && feof(input)) {
+                clearerr(input); // Reset EOF for next shell command
+                break;
+            } else if (input != stdin && feof(input)) {
                 break;
             } else {
-                printf("Read error from stdin.\n");
+                printf("Read error from input.\n");
                 break;
             }
         }
@@ -743,7 +768,6 @@ void write(char *filename) {
         // Update FAT
         uint16_t next_cluster = 0;
         if (!last) {
-            // Find next free cluster
             for (uint16_t c = current_cluster + 1; c < total_clusters; c++) {
                 if (getFatEntry(c) == 0x0000) {
                     next_cluster = c;
@@ -757,29 +781,24 @@ void write(char *filename) {
         } else {
             next_cluster = 0xFFFF; // EOC
         }
-        // Write FAT entry for current cluster
         uint32_t fat_offset = current_cluster * 2;
         uint32_t fat_sector = fs.bs.reserved_sectors + (fat_offset / fs.bs.sector_size);
         uint32_t entry_offset = fat_offset % fs.bs.sector_size;
+        // Zápis do všech kopií FAT tabulky (number_of_fats)
         for (int f = 0; f < fs.bs.number_of_fats; f++) {
             fseek(fs.fp, (fat_sector * fs.bs.sector_size) + fs.pt[0].start_sector * 512 + entry_offset + f * fs.bs.fat_size_sectors * fs.bs.sector_size, SEEK_SET);
             uint16_t val = next_cluster;
             fwrite(&val, 2, 1, fs.fp);
             fflush(fs.fp);
         }
-        if (prev_cluster && prev_cluster != current_cluster) {
-            // Update previous cluster's FAT entry to point to current
-            // Already done in previous loop
-        }
         prev_cluster = current_cluster;
         current_cluster = next_cluster;
         bytes_written += n;
     }
     free(buffer);
-
+    if (src_file) fclose(input);
     // Step 5: Update directory entry with file size
     new_entry.file_size = bytes_written;
-    // Write directory entry back
     uint32_t dir_offset;
     if (current_dir_cluster == 0) {
         dir_offset = fs.root_dir_offset + free_entry_idx * sizeof(Fat16Entry);
@@ -790,8 +809,7 @@ void write(char *filename) {
     fwrite(&new_entry, sizeof(Fat16Entry), 1, fs.fp);
     fflush(fs.fp);
     free(entries);
-    printf("File '%s' written (%u bytes).\n", filename, bytes_written);
-    // Restore previous directory if changed
+    printf("File '%s' written (%u bytes).\n", fatfile, bytes_written);
     if (last_slash) {
         current_dir_cluster = saved_cluster;
         strcpy(current_path, saved_path);
@@ -834,6 +852,19 @@ int initFileSystem(const char* image_path) {
   strcpy(current_path, "/");
   
   return 0;
+}
+
+void printHelp() {
+    printf("Available commands:\n");
+    printf("  cd <dir>                Change directory\n");
+    printf("  ls [dir]                List directory contents\n");
+    printf("  cat <file>              Print file contents\n");
+    printf("  save <file>             Save file from FAT16 to Linux\n");
+    printf("  tree                    Print directory tree\n");
+    printf("  write <file>            Write file from stdin to FAT16\n");
+    printf("  write -f <src> <file>   Write file from Linux file <src> to FAT16\n");
+    printf("  help                    Show this help message\n");
+    printf("  exit, quit              Exit the shell\n");
 }
 
 // CLI command parser and executor
@@ -895,7 +926,10 @@ void executeCommand(char* cmd) {
     // Handled in the main loop
   }
   else if (strncmp(cmd, "write ", 6) == 0) {
-    write(cmd + 6);
+    write(cmd + 6); // now takes the whole arg string
+  }
+  else if (strcmp(cmd, "help") == 0) {
+    printHelp();
   }
   else {
     printf("Unknown command: %s\n", cmd);
@@ -909,8 +943,8 @@ int main() {
     return 1;
   }
   
-  printf("\nEntering interactive mode. Type 'exit' to quit.\n");
-  printf("Available commands: cd, ls, cat, save, tree, write, exit\n");
+  printf("\nEntering interactive mode. Type 'help' for commands, 'exit' to quit.\n");
+  printHelp();
   
   char cmd[256];
   int running = 1;
