@@ -6,3 +6,4 @@ http_server/www/uploads
 gthreads/*.o
 gthreads/gthr_demo
 gthreads/semaphore_test
+file_system/fat
