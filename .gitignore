@@ -7,3 +7,4 @@ gthreads/*.o
 gthreads/gthr_demo
 gthreads/semaphore_test
 file_system/fat
+file_system/fat_fuse
