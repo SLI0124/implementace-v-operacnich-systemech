@@ -830,6 +830,468 @@ static int fat_fuse_write(const char *path, const char *buf, size_t size,
     return size;
 }
 
+// Function to create a new directory
+static int fat_fuse_mkdir(const char *path, mode_t mode)
+{
+    (void) mode;
+    
+    // Save current directory
+    uint16_t saved_cluster = current_dir_cluster;
+    char saved_path[256];
+    strcpy(saved_path, current_path);
+    
+    // Handle paths with directories
+    char path_copy[PATH_MAX];
+    strncpy(path_copy, path, PATH_MAX-1);
+    path_copy[PATH_MAX-1] = '\0';
+    
+    // Extract parent directory path and new directory name
+    char *dirname = path_copy;
+    char *last_slash = strrchr(path_copy, '/');
+    
+    if (last_slash != NULL) {
+        // Split path into directory and dirname parts
+        *last_slash = '\0';
+        dirname = last_slash + 1;
+        
+        // If path is just "/", we're looking in root
+        if (strlen(path_copy) == 0) {
+            // Already at root, do nothing
+        } else {
+            // Change to specified directory
+            if (change_dir(path_copy + 1) != 0) {
+                // Restore original directory
+                current_dir_cluster = saved_cluster;
+                strcpy(current_path, saved_path);
+                return -ENOENT;
+            }
+        }
+    }
+    
+    // Check if directory already exists
+    uint32_t entry_count;
+    Fat16Entry* entries = read_directory(current_dir_cluster, &entry_count);
+    if (!entries) {
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -ENOENT;
+    }
+    
+    // Find the entry
+    Fat16Entry* entry = find_entry_by_name(entries, entry_count, dirname);
+    if (entry) {
+        // Directory already exists
+        free(entries);
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -EEXIST;
+    }
+    
+    free(entries);
+    
+    // Find a free directory entry
+    entries = read_directory(current_dir_cluster, &entry_count);
+    int free_entry_idx = -1;
+    for (uint32_t i = 0; i < entry_count; i++) {
+        if (entries[i].filename[0] == 0x00 || entries[i].filename[0] == 0xE5) {
+            free_entry_idx = i;
+            break;
+        }
+    }
+    
+    if (free_entry_idx == -1) {
+        // No free entry in directory
+        free(entries);
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -ENOSPC;
+    }
+    
+    // Find a free cluster for the new directory
+    uint16_t total_clusters = (fs.bs.total_sectors_short ? fs.bs.total_sectors_short : fs.bs.total_sectors_int) 
+                             / fs.bs.sectors_per_cluster;
+    uint16_t dir_cluster = 0;
+    for (uint16_t c = 2; c < total_clusters; c++) {
+        if (get_fat_entry(c) == 0x0000) {
+            dir_cluster = c;
+            break;
+        }
+    }
+    
+    if (dir_cluster == 0) {
+        // No free cluster
+        free(entries);
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -ENOSPC;
+    }
+    
+    // Create new directory entry
+    Fat16Entry new_entry = {0};
+    char fname[9], ext[4];
+    format_to_fat_name(dirname, fname, ext);
+    memcpy(new_entry.filename, fname, 8);
+    memcpy(new_entry.ext, ext, 3);
+    new_entry.attributes = 0x10;  // Directory attribute
+    new_entry.starting_cluster = dir_cluster;
+    new_entry.file_size = 0;  // Directories don't use file_size
+    
+    // Set date and time
+    time_t now = time(NULL);
+    struct tm *tm_now = localtime(&now);
+    new_entry.modify_date = ((tm_now->tm_year - 80) << 9) | ((tm_now->tm_mon + 1) << 5) | tm_now->tm_mday;
+    new_entry.modify_time = (tm_now->tm_hour << 11) | (tm_now->tm_min << 5) | (tm_now->tm_sec / 2);
+    
+    // Write entry to parent directory
+    uint32_t dir_offset;
+    if (current_dir_cluster == 0) {
+        dir_offset = fs.root_dir_offset + free_entry_idx * sizeof(Fat16Entry);
+    } else {
+        dir_offset = fs.data_area_offset + (current_dir_cluster - 2) * fs.bs.sectors_per_cluster * fs.bs.sector_size 
+                     + free_entry_idx * sizeof(Fat16Entry);
+    }
+    
+    fseek(fs.fp, dir_offset, SEEK_SET);
+    fwrite(&new_entry, sizeof(Fat16Entry), 1, fs.fp);
+    fflush(fs.fp);
+    
+    // Mark directory cluster as end of chain in FAT
+    uint32_t fat_offset = dir_cluster * 2;
+    uint32_t fat_sector = fs.bs.reserved_sectors + (fat_offset / fs.bs.sector_size);
+    uint32_t entry_offset = fat_offset % fs.bs.sector_size;
+    
+    for (int f = 0; f < fs.bs.number_of_fats; f++) {
+        fseek(fs.fp, (fat_sector * fs.bs.sector_size) + fs.pt[0].start_sector * 512 
+              + entry_offset + f * fs.bs.fat_size_sectors * fs.bs.sector_size, SEEK_SET);
+        uint16_t val = 0xFFFF;  // End of chain
+        fwrite(&val, 2, 1, fs.fp);
+        fflush(fs.fp);
+    }
+    
+    // Initialize the directory with "." and ".." entries
+    uint32_t cluster_offset = fs.data_area_offset + (dir_cluster - 2) * fs.bs.sectors_per_cluster * fs.bs.sector_size;
+    
+    // "." entry (points to itself)
+    Fat16Entry dot_entry = {0};
+    memcpy(dot_entry.filename, ".       ", 8);
+    memcpy(dot_entry.ext, "   ", 3);
+    dot_entry.attributes = 0x10;  // Directory
+    dot_entry.starting_cluster = dir_cluster;
+    dot_entry.modify_date = new_entry.modify_date;
+    dot_entry.modify_time = new_entry.modify_time;
+    
+    fseek(fs.fp, cluster_offset, SEEK_SET);
+    fwrite(&dot_entry, sizeof(Fat16Entry), 1, fs.fp);
+    
+    // ".." entry (points to parent)
+    Fat16Entry dotdot_entry = {0};
+    memcpy(dotdot_entry.filename, "..      ", 8);
+    memcpy(dotdot_entry.ext, "   ", 3);
+    dotdot_entry.attributes = 0x10;  // Directory
+    dotdot_entry.starting_cluster = current_dir_cluster;  // Point to parent directory
+    dotdot_entry.modify_date = new_entry.modify_date;
+    dotdot_entry.modify_time = new_entry.modify_time;
+    
+    fwrite(&dotdot_entry, sizeof(Fat16Entry), 1, fs.fp);
+    
+    // Initialize the rest of the directory entries to 0
+    uint32_t remaining_entries = (fs.bs.sectors_per_cluster * fs.bs.sector_size / sizeof(Fat16Entry)) - 2;
+    Fat16Entry empty_entry = {0};
+    for (uint32_t i = 0; i < remaining_entries; i++) {
+        fwrite(&empty_entry, sizeof(Fat16Entry), 1, fs.fp);
+    }
+    fflush(fs.fp);
+    
+    free(entries);
+    
+    // Restore original directory
+    current_dir_cluster = saved_cluster;
+    strcpy(current_path, saved_path);
+    
+    return 0;
+}
+
+// Function to remove a directory
+static int fat_fuse_rmdir(const char *path)
+{
+    // Save current directory
+    uint16_t saved_cluster = current_dir_cluster;
+    char saved_path[256];
+    strcpy(saved_path, current_path);
+    
+    // Handle paths with directories
+    char path_copy[PATH_MAX];
+    strncpy(path_copy, path, PATH_MAX-1);
+    path_copy[PATH_MAX-1] = '\0';
+    
+    // Extract parent directory path and directory name
+    char *dirname = path_copy;
+    char *last_slash = strrchr(path_copy, '/');
+    
+    if (last_slash != NULL) {
+        // Split path into directory and dirname parts
+        *last_slash = '\0';
+        dirname = last_slash + 1;
+        
+        // If path is just "/", we're looking in root
+        if (strlen(path_copy) == 0) {
+            // Already at root, do nothing
+        } else {
+            // Change to specified directory
+            if (change_dir(path_copy + 1) != 0) {
+                // Restore original directory
+                current_dir_cluster = saved_cluster;
+                strcpy(current_path, saved_path);
+                return -ENOENT;
+            }
+        }
+    }
+    
+    // Cannot remove root directory
+    if (strlen(dirname) == 0 || strcmp(dirname, ".") == 0 || strcmp(dirname, "..") == 0) {
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -EINVAL;
+    }
+    
+    // Read parent directory entries
+    uint32_t entry_count;
+    Fat16Entry* entries = read_directory(current_dir_cluster, &entry_count);
+    if (!entries) {
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -ENOENT;
+    }
+    
+    // Find the directory entry
+    Fat16Entry* entry = find_entry_by_name(entries, entry_count, dirname);
+    if (!entry) {
+        free(entries);
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -ENOENT;
+    }
+    
+    // Make sure it's a directory
+    if (!(entry->attributes & 0x10)) {
+        free(entries);
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -ENOTDIR;
+    }
+    
+    // Get the directory cluster
+    uint16_t dir_cluster = entry->starting_cluster;
+    if (dir_cluster == 0) {
+        // Empty directory entry or invalid cluster
+        free(entries);
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -EINVAL;
+    }
+    
+    // Check if directory is empty (except for "." and "..")
+    uint32_t dir_entry_count;
+    Fat16Entry* dir_entries = read_directory(dir_cluster, &dir_entry_count);
+    if (!dir_entries) {
+        free(entries);
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -ENOENT;
+    }
+    
+    for (uint32_t i = 0; i < dir_entry_count; i++) {
+        if (dir_entries[i].filename[0] == 0x00 || dir_entries[i].filename[0] == 0xE5) {
+            continue; // Skip deleted or empty entries
+        }
+        
+        // Skip "." and ".." entries
+        if (dir_entries[i].filename[0] == '.' && 
+            (dir_entries[i].filename[1] == ' ' || 
+             (dir_entries[i].filename[1] == '.' && dir_entries[i].filename[2] == ' '))) {
+            continue;
+        }
+        
+        // If we get here, the directory is not empty
+        free(dir_entries);
+        free(entries);
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -ENOTEMPTY;
+    }
+    
+    free(dir_entries);
+    
+    // Save the directory entry index for later
+    uint32_t entry_idx = entry - entries;
+    
+    // Free the directory cluster in the FAT
+    uint16_t cluster = dir_cluster;
+    while (cluster >= 0x0002 && cluster < 0xFFF8) {
+        uint16_t next_cluster = get_fat_entry(cluster);
+        
+        // Free this cluster in all FAT copies
+        for (int f = 0; f < fs.bs.number_of_fats; f++) {
+            uint32_t fat_offset = cluster * 2;
+            uint32_t fat_sector = fs.bs.reserved_sectors + (fat_offset / fs.bs.sector_size);
+            uint32_t entry_offset = fat_offset % fs.bs.sector_size;
+            
+            fseek(fs.fp, (fat_sector * fs.bs.sector_size) + fs.pt[0].start_sector * 512 
+                  + entry_offset + f * fs.bs.fat_size_sectors * fs.bs.sector_size, SEEK_SET);
+            uint16_t val = 0x0000;  // Free cluster
+            fwrite(&val, 2, 1, fs.fp);
+            fflush(fs.fp);
+        }
+        
+        cluster = next_cluster;
+    }
+    
+    // Mark the directory entry as deleted
+    uint32_t dir_offset;
+    if (current_dir_cluster == 0) {
+        dir_offset = fs.root_dir_offset + entry_idx * sizeof(Fat16Entry);
+    } else {
+        dir_offset = fs.data_area_offset + (current_dir_cluster - 2) * fs.bs.sectors_per_cluster * fs.bs.sector_size 
+                     + entry_idx * sizeof(Fat16Entry);
+    }
+    
+    fseek(fs.fp, dir_offset, SEEK_SET);
+    unsigned char deleted = 0xE5;
+    fwrite(&deleted, 1, 1, fs.fp);  // Write 0xE5 in the first byte of the filename
+    fflush(fs.fp);
+    
+    free(entries);
+    
+    // Restore original directory
+    current_dir_cluster = saved_cluster;
+    strcpy(current_path, saved_path);
+    
+    return 0;
+}
+
+// Function to remove a file
+static int fat_fuse_unlink(const char *path)
+{
+    // Save current directory
+    uint16_t saved_cluster = current_dir_cluster;
+    char saved_path[256];
+    strcpy(saved_path, current_path);
+    
+    // Handle paths with directories
+    char path_copy[PATH_MAX];
+    strncpy(path_copy, path, PATH_MAX-1);
+    path_copy[PATH_MAX-1] = '\0';
+    
+    // Extract directory path and filename
+    char *filename = path_copy;
+    char *last_slash = strrchr(path_copy, '/');
+    
+    if (last_slash != NULL) {
+        // Split path into directory and filename parts
+        *last_slash = '\0';
+        filename = last_slash + 1;
+        
+        // If path is just "/", we're looking in root
+        if (strlen(path_copy) == 0) {
+            // Already at root, do nothing
+        } else {
+            // Change to specified directory
+            if (change_dir(path_copy + 1) != 0) {
+                // Restore original directory
+                current_dir_cluster = saved_cluster;
+                strcpy(current_path, saved_path);
+                return -ENOENT;
+            }
+        }
+    }
+    
+    // Read directory entries
+    uint32_t entry_count;
+    Fat16Entry* entries = read_directory(current_dir_cluster, &entry_count);
+    if (!entries) {
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -ENOENT;
+    }
+    
+    // Find the file entry
+    Fat16Entry* entry = find_entry_by_name(entries, entry_count, filename);
+    if (!entry) {
+        free(entries);
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -ENOENT;
+    }
+    
+    // Make sure it's not a directory
+    if (entry->attributes & 0x10) {
+        free(entries);
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -EISDIR;
+    }
+    
+    // Save the file entry index for later
+    uint32_t entry_idx = entry - entries;
+    
+    // Free all file clusters in the FAT
+    uint16_t cluster = entry->starting_cluster;
+    while (cluster >= 0x0002 && cluster < 0xFFF8) {
+        uint16_t next_cluster = get_fat_entry(cluster);
+        
+        // Free this cluster in all FAT copies
+        for (int f = 0; f < fs.bs.number_of_fats; f++) {
+            uint32_t fat_offset = cluster * 2;
+            uint32_t fat_sector = fs.bs.reserved_sectors + (fat_offset / fs.bs.sector_size);
+            uint32_t entry_offset = fat_offset % fs.bs.sector_size;
+            
+            fseek(fs.fp, (fat_sector * fs.bs.sector_size) + fs.pt[0].start_sector * 512 
+                  + entry_offset + f * fs.bs.fat_size_sectors * fs.bs.sector_size, SEEK_SET);
+            uint16_t val = 0x0000;  // Free cluster
+            fwrite(&val, 2, 1, fs.fp);
+            fflush(fs.fp);
+        }
+        
+        cluster = next_cluster;
+    }
+    
+    // Mark the file entry as deleted
+    uint32_t dir_offset;
+    if (current_dir_cluster == 0) {
+        dir_offset = fs.root_dir_offset + entry_idx * sizeof(Fat16Entry);
+    } else {
+        dir_offset = fs.data_area_offset + (current_dir_cluster - 2) * fs.bs.sectors_per_cluster * fs.bs.sector_size 
+                     + entry_idx * sizeof(Fat16Entry);
+    }
+    
+    fseek(fs.fp, dir_offset, SEEK_SET);
+    unsigned char deleted = 0xE5;
+    fwrite(&deleted, 1, 1, fs.fp);  // Write 0xE5 in the first byte of the filename
+    fflush(fs.fp);
+    
+    free(entries);
+    
+    // Restore original directory
+    current_dir_cluster = saved_cluster;
+    strcpy(current_path, saved_path);
+    
+    return 0;
+}
+
 // Remove unused structures and functions that were causing warnings
 // Only keeping the essential FUSE operations
 
@@ -842,6 +1304,9 @@ static const struct fuse_operations fat_fuse_oper = {
     .read       = fat_fuse_read,
     .create     = fat_fuse_create,
     .write      = fat_fuse_write,
+    .mkdir      = fat_fuse_mkdir,
+    .rmdir      = fat_fuse_rmdir,
+    .unlink     = fat_fuse_unlink,
 };
 
 int main(int argc, char *argv[])
