@@ -10,15 +10,7 @@
 uint16_t current_dir_cluster = 0;
 char current_path[256] = "/";
 
-// Structure to represent file system parameters
-typedef struct {
-    FILE* fp;
-    Fat16BootSector bs;
-    PartitionTable pt[4];
-    uint32_t root_dir_offset;
-    uint32_t data_area_offset;
-} FatFS;
-
+// Initialize the filesystem structure
 FatFS fs;
 
 // Forward declarations
@@ -266,7 +258,7 @@ void print_directory_entries(Fat16Entry* entries, uint32_t entry_count) {
 }
 
 // Revised change_dir implementation
-int change_dir(char* path) {
+int change_dir(const char* path) {
   uint32_t entry_count;
   Fat16Entry* entries;
   Fat16Entry* entry;
@@ -838,6 +830,22 @@ void custom_delete(char *filename) {
   free(entries);
 }
 
+// Convert FAT date/time to Unix timestamp
+time_t fat_date_time_to_unix(uint16_t date, uint16_t time) {
+  struct tm t;
+  memset(&t, 0, sizeof(struct tm));
+  
+  t.tm_sec = (time & 0x1F) * 2;              // 5 bits for seconds (0-29) * 2
+  t.tm_min = (time >> 5) & 0x3F;             // 6 bits for minutes (0-59)
+  t.tm_hour = (time >> 11) & 0x1F;           // 5 bits for hours (0-23)
+  
+  t.tm_mday = date & 0x1F;                   // 5 bits for day (1-31)
+  t.tm_mon = ((date >> 5) & 0x0F) - 1;       // 4 bits for month (1-12), -1 for tm
+  t.tm_year = ((date >> 9) & 0x7F) + 80;     // 7 bits for year (0-127) + 1980 - 1900
+  
+  return mktime(&t);
+}
+
 // Initialization function
 int init_file_system(const char* image_path) {
   int i;
@@ -892,107 +900,42 @@ void print_help() {
 
 // CLI command parser and executor
 void execute_command(char* cmd) {
-  if (strncmp(cmd, "cd ", 3) == 0) {
-    change_dir(cmd + 3);
-  } 
-  else if (strncmp(cmd, "ls ", 3) == 0) {
-    // Handle ls with directory path
-    char* dir_path = cmd + 3;
-    
-    // Save current directory
-    uint16_t saved_cluster = current_dir_cluster;
-    char saved_path[256];
-    strcpy(saved_path, current_path);
-    
-    // Try to change to the specified directory
-    if (change_dir(dir_path) == 0) {
-      // If successful, list its contents
-      uint32_t entry_count;
-      Fat16Entry* entries = read_directory(current_dir_cluster, &entry_count);
-      
-      printf("Directory of %s:\n\n", current_path);
-      
-      if (entries) {
-        print_directory_entries(entries, entry_count);
-        free(entries);
-      }
-      
-      // Restore original directory
-      current_dir_cluster = saved_cluster;
-      strcpy(current_path, saved_path);
-    } else {
-      printf("Directory %s not found\n", dir_path);
-    }
-  }
-  else if (strcmp(cmd, "ls") == 0) {
-    // List current directory
-    uint32_t entry_count;
-    Fat16Entry* entries = read_directory(current_dir_cluster, &entry_count);
-    
-    printf("Directory of %s:\n\n", current_path);
-    
-    if (entries) {
-      print_directory_entries(entries, entry_count);
-      free(entries);
-    }
-  }
-  else if (strncmp(cmd, "cat ", 4) == 0) {
-    cat_file(fs.fp, &fs.bs, cmd + 4, fs.pt);
-  }
-  else if (strncmp(cmd, "save ", 5) == 0) {
-    save_file(fs.fp, &fs.bs, cmd + 5, fs.pt);
-  }
-  else if (strcmp(cmd, "tree") == 0) {
-    print_tree();
-  }
-  else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
-    // Handled in the main loop
-  }
-  else if (strncmp(cmd, "write ", 6) == 0) {
-    custom_write(cmd + 6); // now takes the whole arg string
-  }
-  else if (strncmp(cmd, "rm ", 3) == 0) {
-    custom_delete(cmd + 3);
-  }
-  else if (strcmp(cmd, "help") == 0) {
-    print_help();
-  }
-  else {
-    printf("Unknown command: %s\n", cmd);
-    printf("Available commands: cd, ls, cat, save, tree, write, exit\n");
-  }
+  // ...existing implementation...
 }
 
+#ifndef FUSE_MODE
 // Entry point
 int main() {
-  if (init_file_system("sd.img") != 0) {
+  if (init_file_system("fat16.img")) {
+    fprintf(stderr, "Failed to initialize the FAT file system\n");
     return 1;
   }
-  
-  printf("\nEntering interactive mode. Type 'help' for commands, 'exit' to quit.\n");
-  print_help();
-  
+
+  printf("FAT16 File System Shell\n");
+  printf("Type 'help' for a list of commands.\n");
+
   char cmd[256];
-  int running = 1;
-  
-  while (running) {
-    printf("\nFAT16:%s> ", current_path);
-    if (fgets(cmd, sizeof(cmd), stdin) == NULL) {
-      if (feof(stdin)) {
-        clearerr(stdin); // Reset EOF for next command
-        printf("\n");
-        continue;
-      }
+  while (1) {
+    printf("%s> ", current_path);
+    if (!fgets(cmd, sizeof(cmd), stdin)) break;
+    
+    // Remove trailing newline
+    size_t len = strlen(cmd);
+    if (len > 0 && cmd[len-1] == '\n') cmd[len-1] = '\0';
+    
+    // Skip empty commands
+    if (strlen(cmd) == 0) continue;
+    
+    if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0)
       break;
-    }
-    cmd[strcspn(cmd, "\n")] = '\0';  // Remove newline
-    if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
-      running = 0;
-    } else if (strlen(cmd) > 0) {
-      execute_command(cmd);
-    }
+    
+    execute_command(cmd);
   }
 
-  fclose(fs.fp);
+  if (fs.fp) {
+    fclose(fs.fp);
+  }
+  
   return 0;
 }
+#endif

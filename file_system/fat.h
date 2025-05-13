@@ -1,6 +1,10 @@
 // FAT16 structures
 // see http://www.tavi.co.uk/phobos/fat.html
 
+#include <stdio.h>
+#include <stdint.h>
+#include <time.h>
+
 typedef struct {
     unsigned char first_byte;
     unsigned char start_chs[3];
@@ -45,3 +49,26 @@ typedef struct {
     unsigned short starting_cluster;
     unsigned int file_size;
 } __attribute((packed)) Fat16Entry;
+
+// External structure to represent file system parameters
+typedef struct {
+    FILE* fp;
+    Fat16BootSector bs;
+    PartitionTable pt[4];
+    uint32_t root_dir_offset;
+    uint32_t data_area_offset;
+} FatFS;
+
+// Global variables for use by the fat_fuse.c
+extern FatFS fs;
+extern uint16_t current_dir_cluster;
+extern char current_path[256];
+
+// Function declarations for functions used by fat_fuse.c
+int init_file_system(const char* image_path);
+Fat16Entry* read_directory(uint16_t cluster, uint32_t* entryCount);
+Fat16Entry* find_entry_by_name(Fat16Entry* entries, uint32_t entry_count, const char* name);
+void clean_fat_name(char* dst, const unsigned char* filename, const unsigned char* ext);
+int change_dir(const char* path);
+uint16_t get_fat_entry(uint16_t cluster);
+time_t fat_date_time_to_unix(uint16_t date, uint16_t time);

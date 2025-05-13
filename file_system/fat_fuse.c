@@ -16,12 +16,10 @@
 #include <unistd.h>
 #include <limits.h>  // For PATH_MAX
 
-// Include your FAT implementation headers here
-// #include "fat.h"
+#include "fat.h"
 
 // Global variables
 static const char *fat_img_path = NULL;
-static int fat_img_fd = -1;
 
 // Forward declarations for FAT operations
 // These functions should be implemented in your FAT library
@@ -52,15 +50,11 @@ static void *fat_fuse_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
         exit(1);
     }
     
-    // Open the FAT image file
-    fat_img_fd = open(fat_img_path, O_RDONLY);
-    if (fat_img_fd == -1) {
-        perror("Error opening FAT image");
+    // Initialize the FAT filesystem
+    if (init_file_system(fat_img_path) != 0) {
+        fprintf(stderr, "Failed to initialize FAT filesystem\n");
         exit(1);
     }
-    
-    // Initialize your FAT filesystem here
-    // fat_init(fat_img_fd);
     
     return NULL;
 }
@@ -70,11 +64,8 @@ static void fat_fuse_destroy(void *private_data)
     (void) private_data;
     
     // Clean up FAT resources
-    // fat_cleanup();
-    
-    // Close the image file
-    if (fat_img_fd != -1) {
-        close(fat_img_fd);
+    if (fs.fp) {
+        fclose(fs.fp);
     }
 }
 
@@ -91,18 +82,84 @@ static int fat_fuse_getattr(const char *path, struct stat *stbuf,
         return 0;
     }
     
-    // Use your FAT implementation to get file attributes
-    // return fat_get_attributes(path, stbuf);
+    // Save current directory
+    uint16_t saved_cluster = current_dir_cluster;
+    char saved_path[256];
+    strcpy(saved_path, current_path);
     
-    // Example implementation for testing
-    if (strcmp(path, "/hello.txt") == 0) {
-        stbuf->st_mode = S_IFREG | 0444;
-        stbuf->st_nlink = 1;
-        stbuf->st_size = 13;
-        return 0;
+    // Handle paths with directories
+    char path_copy[PATH_MAX];
+    strncpy(path_copy, path, PATH_MAX-1);
+    path_copy[PATH_MAX-1] = '\0';
+    
+    // Extract directory path and filename
+    char *filename = path_copy;
+    char *last_slash = strrchr(path_copy, '/');
+    
+    if (last_slash != NULL) {
+        // Split path into directory and filename parts
+        *last_slash = '\0';
+        filename = last_slash + 1;
+        
+        // If path is just "/", we're looking in root
+        if (strlen(path_copy) == 0) {
+            // Already at root, do nothing
+        } else {
+            // Change to specified directory
+            if (change_dir(path_copy + 1) != 0) {
+                // Restore original directory
+                current_dir_cluster = saved_cluster;
+                strcpy(current_path, saved_path);
+                return -ENOENT;
+            }
+        }
     }
     
-    return -ENOENT;
+    // Now search for the file/directory in current directory
+    uint32_t entry_count;
+    Fat16Entry* entries = read_directory(current_dir_cluster, &entry_count);
+    if (!entries) {
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -ENOENT;
+    }
+    
+    // Find the entry
+    Fat16Entry* entry = find_entry_by_name(entries, entry_count, filename);
+    if (!entry) {
+        free(entries);
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -ENOENT;
+    }
+    
+    // Set file attributes based on the directory entry
+    if (entry->attributes & 0x10) {
+        // It's a directory
+        stbuf->st_mode = S_IFDIR | 0755;
+        stbuf->st_nlink = 2;
+    } else {
+        // It's a regular file
+        stbuf->st_mode = S_IFREG | 0444;
+        stbuf->st_nlink = 1;
+        stbuf->st_size = entry->file_size;
+    }
+    
+    // Set timestamps
+    time_t modified_time = fat_date_time_to_unix(entry->modify_date, entry->modify_time);
+    stbuf->st_mtime = modified_time;
+    stbuf->st_atime = modified_time;
+    stbuf->st_ctime = modified_time;
+    
+    free(entries);
+    
+    // Restore original directory
+    current_dir_cluster = saved_cluster;
+    strcpy(current_path, saved_path);
+    
+    return 0;
 }
 
 static int fat_fuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
@@ -113,34 +170,135 @@ static int fat_fuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     (void) fi;
     (void) flags;
     
-    // Check if this is the root directory
-    if (strcmp(path, "/") != 0)
-        return -ENOENT;
+    // Save current directory
+    uint16_t saved_cluster = current_dir_cluster;
+    char saved_path[256];
+    strcpy(saved_path, current_path);
+    
+    // Change to the requested directory
+    if (strcmp(path, "/") != 0) {
+        // Remove leading slash for change_dir
+        if (change_dir(path + 1) != 0) {
+            // Restore original directory
+            current_dir_cluster = saved_cluster;
+            strcpy(current_path, saved_path);
+            return -ENOENT;
+        }
+    } else {
+        // Explicitly go to root directory
+        current_dir_cluster = 0;
+        strcpy(current_path, "/");
+    }
     
     // Add the standard directory entries
     filler(buf, ".", NULL, 0, 0);
     filler(buf, "..", NULL, 0, 0);
     
-    // Use your FAT implementation to list directory contents
-    // return fat_read_directory(path, buf, filler);
+    // Read directory entries
+    uint32_t entry_count;
+    Fat16Entry* entries = read_directory(current_dir_cluster, &entry_count);
+    if (!entries) {
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -ENOENT;
+    }
     
-    // Example implementation for testing
-    filler(buf, "hello.txt", NULL, 0, 0);
+    // Iterate through all directory entries
+    for (uint32_t i = 0; i < entry_count; i++) {
+        // Skip deleted or empty entries
+        if (entries[i].filename[0] == 0x00 || entries[i].filename[0] == 0xE5) {
+            continue;
+        }
+        
+        // Skip the "." and ".." entries as we've already added them
+        if (entries[i].filename[0] == '.' && 
+            (entries[i].filename[1] == ' ' || 
+             (entries[i].filename[1] == '.' && entries[i].filename[2] == ' '))) {
+            continue;
+        }
+        
+        // Get a clean filename
+        char name_buf[13];
+        clean_fat_name(name_buf, entries[i].filename, entries[i].ext);
+        
+        // Add this entry to the result
+        if (filler(buf, name_buf, NULL, 0, 0)) {
+            break; // Buffer full
+        }
+    }
+    
+    free(entries);
+    
+    // Restore original directory
+    current_dir_cluster = saved_cluster;
+    strcpy(current_path, saved_path);
     
     return 0;
 }
 
 static int fat_fuse_open(const char *path, struct fuse_file_info *fi)
 {
-    // Check if the file exists
-    // Use your FAT implementation to check file existence
-    // return fat_open_file(path, fi->flags);
+    // Save current directory
+    uint16_t saved_cluster = current_dir_cluster;
+    char saved_path[256];
+    strcpy(saved_path, current_path);
     
-    // Example implementation for testing
-    if (strcmp(path, "/hello.txt") != 0)
+    // Handle paths with directories
+    char path_copy[PATH_MAX];
+    strncpy(path_copy, path, PATH_MAX-1);
+    path_copy[PATH_MAX-1] = '\0';
+    
+    // Extract directory path and filename
+    char *filename = path_copy;
+    char *last_slash = strrchr(path_copy, '/');
+    
+    if (last_slash != NULL) {
+        // Split path into directory and filename parts
+        *last_slash = '\0';
+        filename = last_slash + 1;
+        
+        // If path is just "/", we're looking in root
+        if (strlen(path_copy) == 0) {
+            // Already at root, do nothing
+        } else {
+            // Change to specified directory
+            if (change_dir(path_copy + 1) != 0) {
+                // Restore original directory
+                current_dir_cluster = saved_cluster;
+                strcpy(current_path, saved_path);
+                return -ENOENT;
+            }
+        }
+    }
+    
+    // Now search for the file in current directory
+    uint32_t entry_count;
+    Fat16Entry* entries = read_directory(current_dir_cluster, &entry_count);
+    if (!entries) {
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
         return -ENOENT;
+    }
     
-    // Only allow read-only access for now
+    // Find the entry
+    Fat16Entry* entry = find_entry_by_name(entries, entry_count, filename);
+    if (!entry || (entry->attributes & 0x10)) { // If not found or is a directory
+        free(entries);
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -ENOENT;
+    }
+    
+    free(entries);
+    
+    // Restore original directory
+    current_dir_cluster = saved_cluster;
+    strcpy(current_path, saved_path);
+    
+    // For now, only allow read-only access
     if ((fi->flags & O_ACCMODE) != O_RDONLY)
         return -EACCES;
     
@@ -152,23 +310,115 @@ static int fat_fuse_read(const char *path, char *buf, size_t size,
 {
     (void) fi;
     
-    // Use your FAT implementation to read file contents
-    // return fat_read_file(path, buf, size, offset);
+    // Save current directory
+    uint16_t saved_cluster = current_dir_cluster;
+    char saved_path[256];
+    strcpy(saved_path, current_path);
     
-    // Example implementation for testing
-    if (strcmp(path, "/hello.txt") != 0)
+    // Handle paths with directories
+    char path_copy[PATH_MAX];
+    strncpy(path_copy, path, PATH_MAX-1);
+    path_copy[PATH_MAX-1] = '\0';
+    
+    // Extract directory path and filename
+    char *filename = path_copy;
+    char *last_slash = strrchr(path_copy, '/');
+    
+    if (last_slash != NULL) {
+        // Split path into directory and filename parts
+        *last_slash = '\0';
+        filename = last_slash + 1;
+        
+        // If path is just "/", we're looking in root
+        if (strlen(path_copy) == 0) {
+            // Already at root, do nothing
+        } else {
+            // Change to specified directory
+            if (change_dir(path_copy + 1) != 0) {
+                // Restore original directory
+                current_dir_cluster = saved_cluster;
+                strcpy(current_path, saved_path);
+                return -ENOENT;
+            }
+        }
+    }
+    
+    // Find the file in current directory
+    uint32_t entry_count;
+    Fat16Entry* entries = read_directory(current_dir_cluster, &entry_count);
+    if (!entries) {
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
         return -ENOENT;
+    }
     
-    const char *hello_str = "Hello, World!\n";
-    size_t hello_len = strlen(hello_str);
+    Fat16Entry* entry = find_entry_by_name(entries, entry_count, filename);
+    if (!entry || (entry->attributes & 0x10)) { // If not found or is a directory
+        free(entries);
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -ENOENT;
+    }
     
-    if (offset >= hello_len)
+    // Check if offset is beyond file size
+    if (offset >= entry->file_size) {
+        free(entries);
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
         return 0;
+    }
     
-    if (offset + size > hello_len)
-        size = hello_len - offset;
+    // Adjust size if reading beyond end of file
+    if (offset + size > entry->file_size) {
+        size = entry->file_size - offset;
+    }
     
-    memcpy(buf, hello_str + offset, size);
+    // Allocate buffer for the whole file
+    uint8_t* file_buffer = malloc(entry->file_size);
+    if (!file_buffer) {
+        free(entries);
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -ENOMEM;
+    }
+    
+    // Read file clusters
+    uint16_t cluster = entry->starting_cluster;
+    uint32_t bytes_read = 0;
+    uint32_t cluster_size = fs.bs.sectors_per_cluster * fs.bs.sector_size;
+    
+    while (cluster >= 0x0002 && cluster < 0xFFF8 && bytes_read < entry->file_size) {
+        // Calculate cluster position
+        uint32_t cluster_offset = fs.data_area_offset + (cluster - 2) * cluster_size;
+        
+        // Calculate how much to read from this cluster
+        uint32_t to_read = (entry->file_size - bytes_read) > cluster_size 
+                           ? cluster_size 
+                           : (entry->file_size - bytes_read);
+        
+        // Read the cluster
+        fseek(fs.fp, cluster_offset, SEEK_SET);
+        fread(file_buffer + bytes_read, to_read, 1, fs.fp);
+        
+        bytes_read += to_read;
+        
+        // Get next cluster
+        cluster = get_fat_entry(cluster);
+    }
+    
+    // Copy requested portion to the output buffer
+    memcpy(buf, file_buffer + offset, size);
+    
+    free(file_buffer);
+    free(entries);
+    
+    // Restore original directory
+    current_dir_cluster = saved_cluster;
+    strcpy(current_path, saved_path);
     
     return size;
 }
