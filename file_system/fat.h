@@ -69,6 +69,7 @@ int init_file_system(const char* image_path);
 Fat16Entry* read_directory(uint16_t cluster, uint32_t* entryCount);
 Fat16Entry* find_entry_by_name(Fat16Entry* entries, uint32_t entry_count, const char* name);
 void clean_fat_name(char* dst, const unsigned char* filename, const unsigned char* ext);
+void format_to_fat_name(const char* input, char* fname, char* ext);
 int change_dir(const char* path);
 uint16_t get_fat_entry(uint16_t cluster);
 time_t fat_date_time_to_unix(uint16_t date, uint16_t time);

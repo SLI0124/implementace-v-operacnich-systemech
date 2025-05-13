@@ -423,6 +423,413 @@ static int fat_fuse_read(const char *path, char *buf, size_t size,
     return size;
 }
 
+// Funkce pro vytvoření nového souboru
+static int fat_fuse_create(const char *path, mode_t mode, struct fuse_file_info *fi)
+{
+    (void) fi;
+    (void) mode;
+    
+    // Save current directory
+    uint16_t saved_cluster = current_dir_cluster;
+    char saved_path[256];
+    strcpy(saved_path, current_path);
+    
+    // Handle paths with directories
+    char path_copy[PATH_MAX];
+    strncpy(path_copy, path, PATH_MAX-1);
+    path_copy[PATH_MAX-1] = '\0';
+    
+    // Extract directory path and filename
+    char *filename = path_copy;
+    char *last_slash = strrchr(path_copy, '/');
+    
+    if (last_slash != NULL) {
+        // Split path into directory and filename parts
+        *last_slash = '\0';
+        filename = last_slash + 1;
+        
+        // If path is just "/", we're looking in root
+        if (strlen(path_copy) == 0) {
+            // Already at root, do nothing
+        } else {
+            // Change to specified directory
+            if (change_dir(path_copy + 1) != 0) {
+                // Restore original directory
+                current_dir_cluster = saved_cluster;
+                strcpy(current_path, saved_path);
+                return -ENOENT;
+            }
+        }
+    }
+    
+    // Check if file already exists
+    uint32_t entry_count;
+    Fat16Entry* entries = read_directory(current_dir_cluster, &entry_count);
+    if (!entries) {
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -ENOENT;
+    }
+    
+    // Find the entry
+    Fat16Entry* entry = find_entry_by_name(entries, entry_count, filename);
+    if (entry) {
+        // File already exists
+        free(entries);
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -EEXIST;
+    }
+    
+    free(entries);
+    
+    // Find a free directory entry
+    entries = read_directory(current_dir_cluster, &entry_count);
+    int free_entry_idx = -1;
+    for (uint32_t i = 0; i < entry_count; i++) {
+        if (entries[i].filename[0] == 0x00 || entries[i].filename[0] == 0xE5) {
+            free_entry_idx = i;
+            break;
+        }
+    }
+    
+    if (free_entry_idx == -1) {
+        // No free entry in directory
+        free(entries);
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -ENOSPC;
+    }
+    
+    // Find a free cluster
+    uint16_t total_clusters = (fs.bs.total_sectors_short ? fs.bs.total_sectors_short : fs.bs.total_sectors_int) 
+                             / fs.bs.sectors_per_cluster;
+    uint16_t first_free_cluster = 0;
+    for (uint16_t c = 2; c < total_clusters; c++) {
+        if (get_fat_entry(c) == 0x0000) {
+            first_free_cluster = c;
+            break;
+        }
+    }
+    
+    if (first_free_cluster == 0) {
+        // No free cluster
+        free(entries);
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -ENOSPC;
+    }
+    
+    // Create new entry
+    Fat16Entry new_entry = {0};
+    char fname[9], ext[4];
+    format_to_fat_name(filename, fname, ext);
+    memcpy(new_entry.filename, fname, 8);
+    memcpy(new_entry.ext, ext, 3);
+    new_entry.attributes = 0x20; // Archive
+    new_entry.starting_cluster = first_free_cluster;
+    new_entry.file_size = 0;
+    
+    // Set date and time
+    time_t now = time(NULL);
+    struct tm *tm_now = localtime(&now);
+    new_entry.modify_date = ((tm_now->tm_year - 80) << 9) | ((tm_now->tm_mon + 1) << 5) | tm_now->tm_mday;
+    new_entry.modify_time = (tm_now->tm_hour << 11) | (tm_now->tm_min << 5) | (tm_now->tm_sec / 2);
+    
+    // Write entry to directory
+    uint32_t dir_offset;
+    if (current_dir_cluster == 0) {
+        dir_offset = fs.root_dir_offset + free_entry_idx * sizeof(Fat16Entry);
+    } else {
+        dir_offset = fs.data_area_offset + (current_dir_cluster - 2) * fs.bs.sectors_per_cluster * fs.bs.sector_size 
+                     + free_entry_idx * sizeof(Fat16Entry);
+    }
+    
+    fseek(fs.fp, dir_offset, SEEK_SET);
+    fwrite(&new_entry, sizeof(Fat16Entry), 1, fs.fp);
+    fflush(fs.fp);
+    
+    // Mark end of cluster chain in FAT
+    uint32_t fat_offset = first_free_cluster * 2;
+    uint32_t fat_sector = fs.bs.reserved_sectors + (fat_offset / fs.bs.sector_size);
+    uint32_t entry_offset = fat_offset % fs.bs.sector_size;
+    
+    for (int f = 0; f < fs.bs.number_of_fats; f++) {
+        fseek(fs.fp, (fat_sector * fs.bs.sector_size) + fs.pt[0].start_sector * 512 
+              + entry_offset + f * fs.bs.fat_size_sectors * fs.bs.sector_size, SEEK_SET);
+        uint16_t val = 0xFFFF;  // End of chain
+        fwrite(&val, 2, 1, fs.fp);
+        fflush(fs.fp);
+    }
+    
+    free(entries);
+    
+    // Restore original directory
+    current_dir_cluster = saved_cluster;
+    strcpy(current_path, saved_path);
+    
+    return 0;
+}
+
+// Funkce pro zápis do souboru
+static int fat_fuse_write(const char *path, const char *buf, size_t size,
+                       off_t offset, struct fuse_file_info *fi)
+{
+    (void) fi;
+    
+    // Save current directory
+    uint16_t saved_cluster = current_dir_cluster;
+    char saved_path[256];
+    strcpy(saved_path, current_path);
+    
+    // Handle paths with directories
+    char path_copy[PATH_MAX];
+    strncpy(path_copy, path, PATH_MAX-1);
+    path_copy[PATH_MAX-1] = '\0';
+    
+    // Extract directory path and filename
+    char *filename = path_copy;
+    char *last_slash = strrchr(path_copy, '/');
+    
+    if (last_slash != NULL) {
+        // Split path into directory and filename parts
+        *last_slash = '\0';
+        filename = last_slash + 1;
+        
+        // If path is just "/", we're looking in root
+        if (strlen(path_copy) == 0) {
+            // Already at root, do nothing
+        } else {
+            // Change to specified directory
+            if (change_dir(path_copy + 1) != 0) {
+                // Restore original directory
+                current_dir_cluster = saved_cluster;
+                strcpy(current_path, saved_path);
+                return -ENOENT;
+            }
+        }
+    }
+    
+    // Find the file in current directory
+    uint32_t entry_count;
+    Fat16Entry* entries = read_directory(current_dir_cluster, &entry_count);
+    if (!entries) {
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -ENOENT;
+    }
+    
+    Fat16Entry* entry = find_entry_by_name(entries, entry_count, filename);
+    if (!entry || (entry->attributes & 0x10)) { // If not found or is a directory
+        free(entries);
+        // Restore original directory
+        current_dir_cluster = saved_cluster;
+        strcpy(current_path, saved_path);
+        return -ENOENT;
+    }
+    
+    // Save entry's directory index for later
+    uint32_t entry_idx = entry - entries;
+    
+    // Get current file size
+    uint32_t current_file_size = entry->file_size;
+    uint32_t new_file_size = offset + size > current_file_size ? offset + size : current_file_size;
+    
+    // Allocate a buffer for the entire file
+    uint8_t* file_buffer = NULL;
+    
+    if (offset > 0 || offset < current_file_size) {
+        // If we're not overwriting the whole file, read the existing content first
+        file_buffer = malloc(new_file_size);
+        if (!file_buffer) {
+            free(entries);
+            // Restore original directory
+            current_dir_cluster = saved_cluster;
+            strcpy(current_path, saved_path);
+            return -ENOMEM;
+        }
+        
+        // Initialize buffer with zeros
+        memset(file_buffer, 0, new_file_size);
+        
+        // Read existing file content
+        uint16_t cluster = entry->starting_cluster;
+        uint32_t bytes_read = 0;
+        uint32_t cluster_size = fs.bs.sectors_per_cluster * fs.bs.sector_size;
+        
+        while (cluster >= 0x0002 && cluster < 0xFFF8 && bytes_read < current_file_size) {
+            // Calculate cluster position
+            uint32_t cluster_offset = fs.data_area_offset + (cluster - 2) * cluster_size;
+            
+            // Calculate how much to read from this cluster
+            uint32_t to_read = (current_file_size - bytes_read) > cluster_size 
+                               ? cluster_size 
+                               : (current_file_size - bytes_read);
+            
+            // Read the cluster
+            fseek(fs.fp, cluster_offset, SEEK_SET);
+            fread(file_buffer + bytes_read, to_read, 1, fs.fp);
+            
+            bytes_read += to_read;
+            
+            // Get next cluster
+            cluster = get_fat_entry(cluster);
+        }
+    } else {
+        // If overwriting the whole file or writing to empty file, just allocate needed size
+        file_buffer = malloc(new_file_size);
+        if (!file_buffer) {
+            free(entries);
+            // Restore original directory
+            current_dir_cluster = saved_cluster;
+            strcpy(current_path, saved_path);
+            return -ENOMEM;
+        }
+        
+        // Initialize buffer with zeros
+        memset(file_buffer, 0, new_file_size);
+    }
+    
+    // Copy new data to buffer at specified offset
+    memcpy(file_buffer + offset, buf, size);
+    
+    // Calculate how many clusters we need
+    uint32_t cluster_size = fs.bs.sectors_per_cluster * fs.bs.sector_size;
+    uint32_t clusters_needed = (new_file_size + cluster_size - 1) / cluster_size;
+    
+    // Free existing clusters if file size changed
+    if (new_file_size != current_file_size) {
+        uint16_t cluster = entry->starting_cluster;
+        while (cluster >= 0x0002 && cluster < 0xFFF8) {
+            uint16_t next_cluster = get_fat_entry(cluster);
+            
+            // Free this cluster in all FAT copies
+            for (int f = 0; f < fs.bs.number_of_fats; f++) {
+                uint32_t fat_offset = cluster * 2;
+                uint32_t fat_sector = fs.bs.reserved_sectors + (fat_offset / fs.bs.sector_size);
+                uint32_t entry_offset = fat_offset % fs.bs.sector_size;
+                
+                fseek(fs.fp, (fat_sector * fs.bs.sector_size) + fs.pt[0].start_sector * 512 
+                      + entry_offset + f * fs.bs.fat_size_sectors * fs.bs.sector_size, SEEK_SET);
+                uint16_t val = 0x0000;  // Free cluster
+                fwrite(&val, 2, 1, fs.fp);
+                fflush(fs.fp);
+            }
+            
+            cluster = next_cluster;
+        }
+        
+        entry->starting_cluster = 0;
+    }
+    
+    // Allocate new clusters
+    uint16_t first_cluster = 0;
+    uint16_t current_cluster = 0;
+    uint16_t total_clusters = (fs.bs.total_sectors_short ? fs.bs.total_sectors_short : fs.bs.total_sectors_int) 
+                             / fs.bs.sectors_per_cluster;
+    
+    for (uint32_t i = 0; i < clusters_needed; i++) {
+        // Find a free cluster
+        uint16_t new_cluster = 0;
+        for (uint16_t c = 2; c < total_clusters; c++) {
+            if (get_fat_entry(c) == 0x0000) {
+                new_cluster = c;
+                break;
+            }
+        }
+        
+        if (new_cluster == 0) {
+            // No free cluster found
+            free(file_buffer);
+            free(entries);
+            // Restore original directory
+            current_dir_cluster = saved_cluster;
+            strcpy(current_path, saved_path);
+            return -ENOSPC;
+        }
+        
+        // Link it to the previous cluster if needed
+        if (current_cluster != 0) {
+            // Update FAT entry for current cluster to point to the new one
+            for (int f = 0; f < fs.bs.number_of_fats; f++) {
+                uint32_t fat_offset = current_cluster * 2;
+                uint32_t fat_sector = fs.bs.reserved_sectors + (fat_offset / fs.bs.sector_size);
+                uint32_t entry_offset = fat_offset % fs.bs.sector_size;
+                
+                fseek(fs.fp, (fat_sector * fs.bs.sector_size) + fs.pt[0].start_sector * 512 
+                      + entry_offset + f * fs.bs.fat_size_sectors * fs.bs.sector_size, SEEK_SET);
+                fwrite(&new_cluster, 2, 1, fs.fp);
+                fflush(fs.fp);
+            }
+        } else {
+            // This is the first cluster
+            first_cluster = new_cluster;
+        }
+        
+        // Mark the new cluster as the end of the chain
+        for (int f = 0; f < fs.bs.number_of_fats; f++) {
+            uint32_t fat_offset = new_cluster * 2;
+            uint32_t fat_sector = fs.bs.reserved_sectors + (fat_offset / fs.bs.sector_size);
+            uint32_t entry_offset = fat_offset % fs.bs.sector_size;
+            
+            fseek(fs.fp, (fat_sector * fs.bs.sector_size) + fs.pt[0].start_sector * 512 
+                  + entry_offset + f * fs.bs.fat_size_sectors * fs.bs.sector_size, SEEK_SET);
+            uint16_t val = 0xFFFF;  // End of chain
+            fwrite(&val, 2, 1, fs.fp);
+            fflush(fs.fp);
+        }
+        
+        // Write data to this cluster
+        uint32_t cluster_offset = fs.data_area_offset + (new_cluster - 2) * cluster_size;
+        uint32_t bytes_to_write = (i == clusters_needed - 1) 
+                                ? (new_file_size - i * cluster_size) 
+                                : cluster_size;
+        
+        fseek(fs.fp, cluster_offset, SEEK_SET);
+        fwrite(file_buffer + (i * cluster_size), bytes_to_write, 1, fs.fp);
+        fflush(fs.fp);
+        
+        current_cluster = new_cluster;
+    }
+    
+    // Update directory entry
+    entry->starting_cluster = first_cluster;
+    entry->file_size = new_file_size;
+    
+    // Set date and time
+    time_t now = time(NULL);
+    struct tm *tm_now = localtime(&now);
+    entry->modify_date = ((tm_now->tm_year - 80) << 9) | ((tm_now->tm_mon + 1) << 5) | tm_now->tm_mday;
+    entry->modify_time = (tm_now->tm_hour << 11) | (tm_now->tm_min << 5) | (tm_now->tm_sec / 2);
+    
+    // Write updated directory entry
+    uint32_t dir_offset;
+    if (current_dir_cluster == 0) {
+        dir_offset = fs.root_dir_offset + entry_idx * sizeof(Fat16Entry);
+    } else {
+        dir_offset = fs.data_area_offset + (current_dir_cluster - 2) * fs.bs.sectors_per_cluster * fs.bs.sector_size 
+                     + entry_idx * sizeof(Fat16Entry);
+    }
+    
+    fseek(fs.fp, dir_offset, SEEK_SET);
+    fwrite(entry, sizeof(Fat16Entry), 1, fs.fp);
+    fflush(fs.fp);
+    
+    free(file_buffer);
+    free(entries);
+    
+    // Restore original directory
+    current_dir_cluster = saved_cluster;
+    strcpy(current_path, saved_path);
+    
+    return size;
+}
+
 // Remove unused structures and functions that were causing warnings
 // Only keeping the essential FUSE operations
 
@@ -433,6 +840,8 @@ static const struct fuse_operations fat_fuse_oper = {
     .readdir    = fat_fuse_readdir,
     .open       = fat_fuse_open,
     .read       = fat_fuse_read,
+    .create     = fat_fuse_create,
+    .write      = fat_fuse_write,
 };
 
 int main(int argc, char *argv[])
