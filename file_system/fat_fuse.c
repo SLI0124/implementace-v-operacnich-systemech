@@ -1,8 +1,3 @@
-/*
-  FUSE: Filesystem in Userspace
-  FAT filesystem wrapper implementation
-*/
-
 #define FUSE_USE_VERSION 30
 
 #include <fuse.h>
@@ -14,19 +9,13 @@
 #include <stddef.h>
 #include <assert.h>
 #include <unistd.h>
-#include <limits.h>  // For PATH_MAX
+#include <limits.h>
+#include <time.h>
 
 #include "fat.h"
 
 // Global variables
 static const char *fat_img_path = NULL;
-
-// Forward declarations for FAT operations
-// These functions should be implemented in your FAT library
-// static int fat_read_directory(const char *path, void *buffer, fuse_fill_dir_t filler);
-// static int fat_get_attributes(const char *path, struct stat *stbuf);
-// static int fat_open_file(const char *path, int flags);
-// static int fat_read_file(const char *path, char *buf, size_t size, off_t offset);
 
 // Forward declarations for helper functions
 static int is_binary_file(const char* filename);
@@ -39,14 +28,9 @@ static void *fat_fuse_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
     
     printf("Opening FAT image: %s\n", fat_img_path);
     
-    // Get current working directory for debugging
-    char cwd[PATH_MAX];
-    if (getcwd(cwd, sizeof(cwd)) != NULL) {
-        printf("Current working directory: %s\n", cwd);
-    }
-    
-    // Check if the file exists first
+    // Verify that the FAT image exists
     if (access(fat_img_path, F_OK) == -1) {
+        char cwd[PATH_MAX];
         fprintf(stderr, "Error: File '%s' does not exist\n", fat_img_path);
         if (getcwd(cwd, sizeof(cwd)) != NULL) {
             fprintf(stderr, "Current working directory: %s\n", cwd);
@@ -67,7 +51,7 @@ static void fat_fuse_destroy(void *private_data)
 {
     (void) private_data;
     
-    // Clean up FAT resources
+    // Clean up FAT resources when unmounting
     if (fs.fp) {
         fclose(fs.fp);
     }
@@ -79,39 +63,37 @@ static int fat_fuse_getattr(const char *path, struct stat *stbuf,
     (void) fi;
     memset(stbuf, 0, sizeof(struct stat));
     
-    // Root directory
+    // Handle root directory specially
     if (strcmp(path, "/") == 0) {
         stbuf->st_mode = S_IFDIR | 0755;
         stbuf->st_nlink = 2;
         return 0;
     }
     
-    // Save current directory
+    // Save current directory state to restore later
     uint16_t saved_cluster = current_dir_cluster;
     char saved_path[256];
     strcpy(saved_path, current_path);
     
-    // Handle paths with directories
+    // Make a copy of the path for manipulation
     char path_copy[PATH_MAX];
     strncpy(path_copy, path, PATH_MAX-1);
     path_copy[PATH_MAX-1] = '\0';
     
-    // Extract directory path and filename
+    // Split path into directory and filename parts
     char *filename = path_copy;
     char *last_slash = strrchr(path_copy, '/');
     
     if (last_slash != NULL) {
-        // Split path into directory and filename parts
         *last_slash = '\0';
         filename = last_slash + 1;
         
-        // If path is just "/", we're looking in root
+        // Handle parent directory navigation
         if (strlen(path_copy) == 0) {
-            // Already at root, do nothing
+            // Root directory, no navigation needed
         } else {
-            // Change to specified directory
+            // Navigate to the specified directory
             if (change_dir(path_copy + 1) != 0) {
-                // Restore original directory
                 current_dir_cluster = saved_cluster;
                 strcpy(current_path, saved_path);
                 return -ENOENT;
@@ -152,12 +134,10 @@ static int fat_fuse_getattr(const char *path, struct stat *stbuf,
         
         // Special handling for binary files
         if (is_binary_file(filename)) {
-            // Set direct reading/writing bit for GIFs and images
             stbuf->st_mode = S_IFREG | 0444;
             
             // For animated GIFs, set a hint for viewers
             if (is_animated_gif(filename)) {
-                // Some viewers might check these bits for animated content
                 stbuf->st_mode |= 0111;  // Add executable bit as a hint for some viewers
             }
         }
@@ -186,16 +166,14 @@ static int fat_fuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     (void) fi;
     (void) flags;
     
-    // Save current directory
+    // Save current directory state to restore later
     uint16_t saved_cluster = current_dir_cluster;
     char saved_path[256];
     strcpy(saved_path, current_path);
     
     // Change to the requested directory
     if (strcmp(path, "/") != 0) {
-        // Remove leading slash for change_dir
         if (change_dir(path + 1) != 0) {
-            // Restore original directory
             current_dir_cluster = saved_cluster;
             strcpy(current_path, saved_path);
             return -ENOENT;
@@ -234,14 +212,14 @@ static int fat_fuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
             continue;
         }
         
-        // Get a clean filename
-        char name_buf[13];
-        clean_fat_name(name_buf, entries[i].filename, entries[i].ext);
-        
-        // Add this entry to the result
-        if (filler(buf, name_buf, NULL, 0, 0)) {
-            break; // Buffer full
-        }
+    // Get a clean filename
+    char name_buf[13];
+    clean_fat_name(name_buf, entries[i].filename, entries[i].ext);
+    
+    // Add this entry to the result
+    if (filler(buf, name_buf, NULL, 0, 0)) {
+        break; // Buffer full
+    }
     }
     
     free(entries);
@@ -255,7 +233,7 @@ static int fat_fuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
 static int fat_fuse_open(const char *path, struct fuse_file_info *fi)
 {
-    // Save current directory
+    // Save current directory state to restore later
     uint16_t saved_cluster = current_dir_cluster;
     char saved_path[256];
     strcpy(saved_path, current_path);
@@ -316,14 +294,14 @@ static int fat_fuse_open(const char *path, struct fuse_file_info *fi)
     
     // Allow any type of read access, including direct_io for binary files
     if ((fi->flags & O_ACCMODE) == O_RDONLY) {
-        // Check if it's an image or multimedia file by extension
+        // Enable direct I/O for multimedia files for better streaming
         if (strstr(filename, ".gif") || strstr(filename, ".GIF") ||
             strstr(filename, ".jpg") || strstr(filename, ".JPG") ||
             strstr(filename, ".png") || strstr(filename, ".PNG") ||
             strstr(filename, ".bmp") || strstr(filename, ".BMP") ||
             strstr(filename, ".mp3") || strstr(filename, ".MP3") ||
             strstr(filename, ".mp4") || strstr(filename, ".MP4")) {
-            fi->direct_io = 1;  // Use direct I/O for better streaming
+            fi->direct_io = 1;
         }
         return 0;
     }
@@ -331,7 +309,7 @@ static int fat_fuse_open(const char *path, struct fuse_file_info *fi)
     // For write operations, check if write support is enabled
     if ((fi->flags & O_ACCMODE) != O_RDONLY && 
         ((fi->flags & O_ACCMODE) == O_WRONLY || (fi->flags & O_ACCMODE) == O_RDWR)) {
-        return 0;  // Allow write operations since we've implemented write support
+        return 0;  // Allow write operations
     }
     
     return -EACCES;
@@ -342,7 +320,7 @@ static int fat_fuse_read(const char *path, char *buf, size_t size,
 {
     (void) fi;
     
-    // Save current directory
+    // Save current directory state to restore later
     uint16_t saved_cluster = current_dir_cluster;
     char saved_path[256];
     strcpy(saved_path, current_path);
@@ -473,7 +451,7 @@ static int fat_fuse_read(const char *path, char *buf, size_t size,
     return size;
 }
 
-// Funkce pro vytvoření nového souboru
+// Creates a new file in the FAT filesystem
 static int fat_fuse_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
     (void) fi;
@@ -625,7 +603,7 @@ static int fat_fuse_create(const char *path, mode_t mode, struct fuse_file_info 
     return 0;
 }
 
-// Funkce pro zápis do souboru
+// Write data to a file
 static int fat_fuse_write(const char *path, const char *buf, size_t size,
                        off_t offset, struct fuse_file_info *fi)
 {
@@ -880,12 +858,12 @@ static int fat_fuse_write(const char *path, const char *buf, size_t size,
     return size;
 }
 
-// Function to create a new directory
+// Creates a new directory in the FAT filesystem
 static int fat_fuse_mkdir(const char *path, mode_t mode)
 {
     (void) mode;
     
-    // Save current directory
+    // Save current directory state to restore later
     uint16_t saved_cluster = current_dir_cluster;
     char saved_path[256];
     strcpy(saved_path, current_path);
@@ -1065,10 +1043,10 @@ static int fat_fuse_mkdir(const char *path, mode_t mode)
     return 0;
 }
 
-// Function to remove a directory
+// Removes a directory
 static int fat_fuse_rmdir(const char *path)
 {
-    // Save current directory
+    // Save current directory state to restore later
     uint16_t saved_cluster = current_dir_cluster;
     char saved_path[256];
     strcpy(saved_path, current_path);
@@ -1230,10 +1208,10 @@ static int fat_fuse_rmdir(const char *path)
     return 0;
 }
 
-// Function to remove a file
+// Removes a file from the FAT filesystem
 static int fat_fuse_unlink(const char *path)
 {
-    // Save current directory
+    // Save current directory state to restore later
     uint16_t saved_cluster = current_dir_cluster;
     char saved_path[256];
     strcpy(saved_path, current_path);
@@ -1243,7 +1221,7 @@ static int fat_fuse_unlink(const char *path)
     strncpy(path_copy, path, PATH_MAX-1);
     path_copy[PATH_MAX-1] = '\0';
     
-    // Extract directory path and filename
+    // Split path into directory and filename parts
     char *filename = path_copy;
     char *last_slash = strrchr(path_copy, '/');
     
@@ -1342,7 +1320,7 @@ static int fat_fuse_unlink(const char *path)
     return 0;
 }
 
-// Helper function to determine if a file is binary/media
+// Check if file has a binary/media file extension
 static int is_binary_file(const char* filename) {
     static const char* binary_extensions[] = {
         ".gif", ".GIF", ".jpg", ".JPG", ".jpeg", ".JPEG",
@@ -1362,7 +1340,7 @@ static int is_binary_file(const char* filename) {
     return 0;
 }
 
-// Helper function to determine if a file is an animated GIF
+// Check if file is an animated GIF based on extension
 static int is_animated_gif(const char* filename) {
     return (strstr(filename, ".gif") || strstr(filename, ".GIF"));
 }
@@ -1386,13 +1364,13 @@ static const struct fuse_operations fat_fuse_oper = {
 
 int main(int argc, char *argv[])
 {
-    // Need at least 3 arguments: program name, image path, mount point
+    // Require at least 3 arguments: program name, image path, mount point
     if (argc < 3) {
         fprintf(stderr, "Usage: %s [FUSE options] <fat_image> <mountpoint>\n", argv[0]);
         return 1;
     }
     
-    // Find the position of the image path and mount point
+    // Identify the positions of image path and mount point arguments
     int img_pos = -1;
     int mount_pos = -1;
     
