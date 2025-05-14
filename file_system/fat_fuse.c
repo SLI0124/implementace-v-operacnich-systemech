@@ -28,6 +28,10 @@ static const char *fat_img_path = NULL;
 // static int fat_open_file(const char *path, int flags);
 // static int fat_read_file(const char *path, char *buf, size_t size, off_t offset);
 
+// Forward declarations for helper functions
+static int is_binary_file(const char* filename);
+static int is_animated_gif(const char* filename);
+
 static void *fat_fuse_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
 {
     (void) conn;
@@ -145,6 +149,18 @@ static int fat_fuse_getattr(const char *path, struct stat *stbuf,
         stbuf->st_mode = S_IFREG | 0444;
         stbuf->st_nlink = 1;
         stbuf->st_size = entry->file_size;
+        
+        // Special handling for binary files
+        if (is_binary_file(filename)) {
+            // Set direct reading/writing bit for GIFs and images
+            stbuf->st_mode = S_IFREG | 0444;
+            
+            // For animated GIFs, set a hint for viewers
+            if (is_animated_gif(filename)) {
+                // Some viewers might check these bits for animated content
+                stbuf->st_mode |= 0111;  // Add executable bit as a hint for some viewers
+            }
+        }
     }
     
     // Set timestamps
@@ -298,11 +314,27 @@ static int fat_fuse_open(const char *path, struct fuse_file_info *fi)
     current_dir_cluster = saved_cluster;
     strcpy(current_path, saved_path);
     
-    // For now, only allow read-only access
-    if ((fi->flags & O_ACCMODE) != O_RDONLY)
-        return -EACCES;
+    // Allow any type of read access, including direct_io for binary files
+    if ((fi->flags & O_ACCMODE) == O_RDONLY) {
+        // Check if it's an image or multimedia file by extension
+        if (strstr(filename, ".gif") || strstr(filename, ".GIF") ||
+            strstr(filename, ".jpg") || strstr(filename, ".JPG") ||
+            strstr(filename, ".png") || strstr(filename, ".PNG") ||
+            strstr(filename, ".bmp") || strstr(filename, ".BMP") ||
+            strstr(filename, ".mp3") || strstr(filename, ".MP3") ||
+            strstr(filename, ".mp4") || strstr(filename, ".MP4")) {
+            fi->direct_io = 1;  // Use direct I/O for better streaming
+        }
+        return 0;
+    }
     
-    return 0;
+    // For write operations, check if write support is enabled
+    if ((fi->flags & O_ACCMODE) != O_RDONLY && 
+        ((fi->flags & O_ACCMODE) == O_WRONLY || (fi->flags & O_ACCMODE) == O_RDWR)) {
+        return 0;  // Allow write operations since we've implemented write support
+    }
+    
+    return -EACCES;
 }
 
 static int fat_fuse_read(const char *path, char *buf, size_t size,
@@ -402,12 +434,30 @@ static int fat_fuse_read(const char *path, char *buf, size_t size,
         
         // Read the cluster
         fseek(fs.fp, cluster_offset, SEEK_SET);
-        fread(file_buffer + bytes_read, to_read, 1, fs.fp);
+        size_t bytes_actually_read = fread(file_buffer + bytes_read, 1, to_read, fs.fp);
+        
+        // Verify if the read was successful
+        if (bytes_actually_read != to_read) {
+            fprintf(stderr, "Warning: Read %zu bytes instead of %u from cluster %u\n", 
+                    bytes_actually_read, to_read, cluster);
+            
+            // Still count what we were able to read
+            bytes_read += bytes_actually_read;
+            break;
+        }
         
         bytes_read += to_read;
         
         // Get next cluster
-        cluster = get_fat_entry(cluster);
+        uint16_t next_cluster = get_fat_entry(cluster);
+        
+        // Detect cluster loops (corrupted FAT chain)
+        if (next_cluster == cluster) {
+            fprintf(stderr, "Warning: FAT chain loop detected at cluster %u\n", cluster);
+            break;
+        }
+        
+        cluster = next_cluster;
     }
     
     // Copy requested portion to the output buffer
@@ -1290,6 +1340,31 @@ static int fat_fuse_unlink(const char *path)
     strcpy(current_path, saved_path);
     
     return 0;
+}
+
+// Helper function to determine if a file is binary/media
+static int is_binary_file(const char* filename) {
+    static const char* binary_extensions[] = {
+        ".gif", ".GIF", ".jpg", ".JPG", ".jpeg", ".JPEG",
+        ".png", ".PNG", ".bmp", ".BMP", ".tif", ".TIF",
+        ".mp3", ".MP3", ".mp4", ".MP4", ".avi", ".AVI",
+        ".mov", ".MOV", ".zip", ".ZIP", ".exe", ".EXE",
+        ".pdf", ".PDF", ".doc", ".DOC", ".xls", ".XLS",
+        NULL
+    };
+    
+    for (int i = 0; binary_extensions[i] != NULL; i++) {
+        if (strstr(filename, binary_extensions[i])) {
+            return 1;
+        }
+    }
+    
+    return 0;
+}
+
+// Helper function to determine if a file is an animated GIF
+static int is_animated_gif(const char* filename) {
+    return (strstr(filename, ".gif") || strstr(filename, ".GIF"));
 }
 
 // Remove unused structures and functions that were causing warnings
