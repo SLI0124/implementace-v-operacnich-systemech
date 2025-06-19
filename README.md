@@ -6,3 +6,10 @@ absolvování předmětu budou schopni navrhovat své programy efektivně tak, a
 operačního systému.
 
 [Odkaz](https://ivos.mrl.cz/) na předmět s přednáškami a cvičeními.
+
+V jednotlivých adresářích se nachází řešení úloh z předmětu. Taky je zde `Makefile`, který umožňuje spustit jednotlivou
+úlohu v podadresáři.
+
+- u HTTP serveru jsem ztratil bod za krátký buffer pro PHP výstup, chybějící styl u `phpinfo()` a chybějící přesměrování na stránku s chybou 503 při nedostatku semaforů
+- u plánovačů jsem ztratil bod za to, že jsem neudělal odolonost proti příkazu přerušení v kritické sekci
+- souborový systém byl za plný počet 
