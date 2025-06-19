@@ -1406,14 +1406,6 @@ int main(int argc, char *argv[])
             }
             image_path = image_abs_path;
         }
-    } else if (strncmp(image_path, "/vojte/", 7) == 0) {
-        // Fix paths that start with /vojte/ instead of /home/vojte/
-        if (snprintf(image_abs_path, PATH_MAX, "/home%s", image_path) >= PATH_MAX) {
-            fprintf(stderr, "Error: Corrected image path is too long\n");
-            return 1;
-        }
-        image_path = image_abs_path;
-        printf("Corrected image path: %s\n", image_path);
     }
     
     // Check if the file exists before starting FUSE
@@ -1479,17 +1471,6 @@ int main(int argc, char *argv[])
             // Replace the relative mount point with absolute path
             argv[mount_pos] = mount_abs_path;
             printf("Absolute mount point path: %s\n", mount_abs_path);
-        }
-    } else {
-        // Check if the path starts with "/vojte/" instead of "/home/vojte/"
-        if (strncmp(argv[mount_pos], "/vojte/", 7) == 0) {
-            if (snprintf(mount_abs_path, PATH_MAX, "/home%s", argv[mount_pos]) >= PATH_MAX) {
-                fprintf(stderr, "Error: Corrected mount point path is too long\n");
-                free((void*)fat_img_path);
-                return 1;
-            }
-            argv[mount_pos] = mount_abs_path;
-            printf("Corrected absolute mount point path: %s\n", mount_abs_path);
         }
     }
     
